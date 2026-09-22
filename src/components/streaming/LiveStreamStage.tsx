@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
   Monitor,
   Mic,
@@ -19,6 +19,7 @@ import {
   Zap,
   PictureInPicture,
   RefreshCw,
+  Play,
 } from 'lucide-react';
 import { StreamState, EmojiReaction, SignalMessage } from '@/lib/types';
 import {
@@ -43,6 +44,12 @@ interface LiveStreamStageProps {
   onStreamStateChanged: (update: Partial<StreamState>) => void;
 }
 
+// Safely get PeerJS class on client side only
+async function getPeerClass() {
+  const mod = await import('peerjs');
+  return (mod as any).Peer || (mod as any).default?.Peer || (mod as any).default;
+}
+
 export function LiveStreamStage({
   roomId,
   isHost,
@@ -54,35 +61,42 @@ export function LiveStreamStage({
   viewers,
   onStreamStateChanged,
 }: LiveStreamStageProps) {
-  // Host stream state
+  // Broadcaster state (active when THIS tab is sharing)
   const [captureResult, setCaptureResult] = useState<CaptureResult | null>(null);
   const [resolution, setResolution] = useState<'1080p' | '720p' | '4k'>('1080p');
   const [includeAudio, setIncludeAudio] = useState(true);
   const [includeMic, setIncludeMic] = useState(false);
   const [isMicMuted, setIsMicMuted] = useState(false);
   const [audioLevel, setAudioLevel] = useState(0);
+  const [showConfig, setShowConfig] = useState(false);
 
   // Viewer state
   const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null);
   const [volume, setVolume] = useState(1);
   const [isMuted, setIsMuted] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
-  const [latencyMs, setLatencyMs] = useState(85);
+  const [latencyMs, setLatencyMs] = useState(75);
   const [connectionStatus, setConnectionStatus] = useState<'disconnected' | 'connecting' | 'connected'>('disconnected');
+  const [isCheckingHost, setIsCheckingHost] = useState(false);
 
   // DOM Refs
   const stageContainerRef = useRef<HTMLDivElement>(null);
   const localVideoRef = useRef<HTMLVideoElement>(null);
   const remoteVideoRef = useRef<HTMLVideoElement>(null);
 
-  // WebRTC Peer Connections map (for Host: viewerId -> RTCPeerConnection; for Viewer: 'host' -> RTCPeerConnection)
-  const peerConnectionsRef = useRef<Map<string, RTCPeerConnection>>(new Map());
-  const pendingCandidatesRef = useRef<Map<string, RTCIceCandidateInit[]>>(new Map());
+  // Communication & Signaling Refs
+  const bcRef = useRef<BroadcastChannel | null>(null);
+  const hostPeerRef = useRef<any>(null);
+  const viewerPeerRef = useRef<any>(null);
+  const activeConnsRef = useRef<Map<string, any>>(new Map());
+  const activeCallsRef = useRef<Map<string, any>>(new Map());
   const processedSignalsRef = useRef<Set<string>>(new Set());
 
-  // ==========================================
-  // 1. HOST: Start / Stop Screen Sharing
-  // ==========================================
+  const isBroadcasting = !!captureResult;
+
+  // ============================================================
+  // 1. BROADCASTER: Start / Stop Live Screen Sharing
+  // ============================================================
   const handleStartShare = async () => {
     try {
       const result = await startScreenCapture({
@@ -97,12 +111,11 @@ export function LiveStreamStage({
         localVideoRef.current.srcObject = result.stream;
       }
 
-      // Handle when host clicks browser's native "Stop Sharing" floating bar
+      // Handle native browser "Stop sharing" floating bar
       result.displayStream.getVideoTracks()[0].onended = () => {
         handleStopShare();
       };
 
-      // Notify room that stream is live
       const newStreamState: Partial<StreamState> = {
         isStreaming: true,
         streamTitle: `${currentUserName}'s Live Screen`,
@@ -115,8 +128,19 @@ export function LiveStreamStage({
 
       onStreamStateChanged(newStreamState);
 
-      // Post signal with streamUpdate
-      await fetch(`/api/rooms/${roomId}/signal`, {
+      // Tier 1: BroadcastChannel (0ms local tabs sync)
+      bcRef.current?.postMessage({
+        type: 'stream-started',
+        streamState: newStreamState,
+        broadcasterId: currentUserId,
+        broadcasterName: currentUserName,
+      });
+
+      // Tier 2: PeerJS Cloud Broadcaster Setup
+      setupHostPeer(result.stream, newStreamState);
+
+      // Tier 3: Serverless signal route
+      fetch(`/api/rooms/${roomId}/signal`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -125,16 +149,8 @@ export function LiveStreamStage({
           senderName: currentUserName,
           streamUpdate: newStreamState,
         }),
-      });
+      }).catch(console.error);
 
-      // Broadcast offers to all currently active viewers
-      if (viewers) {
-        Object.keys(viewers).forEach((vId) => {
-          if (vId !== currentUserId) {
-            sendOfferToViewer(vId, result.stream);
-          }
-        });
-      }
     } catch (err) {
       console.error('Failed to start screen share:', err);
     }
@@ -150,9 +166,24 @@ export function LiveStreamStage({
       localVideoRef.current.srcObject = null;
     }
 
-    // Close all host peer connections
-    peerConnectionsRef.current.forEach((pc) => pc.close());
-    peerConnectionsRef.current.clear();
+    // Inform all connected viewers on PeerJS
+    activeConnsRef.current.forEach((conn) => {
+      try {
+        conn.send({ type: 'stream-stopped' });
+        conn.close();
+      } catch {}
+    });
+    activeConnsRef.current.clear();
+
+    activeCallsRef.current.forEach((call) => {
+      try { call.close(); } catch {}
+    });
+    activeCallsRef.current.clear();
+
+    if (hostPeerRef.current) {
+      try { hostPeerRef.current.destroy(); } catch {}
+      hostPeerRef.current = null;
+    }
 
     const stoppedState: Partial<StreamState> = {
       isStreaming: false,
@@ -161,7 +192,13 @@ export function LiveStreamStage({
 
     onStreamStateChanged(stoppedState);
 
-    await fetch(`/api/rooms/${roomId}/signal`, {
+    // BroadcastChannel stop
+    bcRef.current?.postMessage({
+      type: 'stream-stopped',
+    });
+
+    // Serverless API stop
+    fetch(`/api/rooms/${roomId}/signal`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -170,10 +207,76 @@ export function LiveStreamStage({
         senderName: currentUserName,
         streamUpdate: stoppedState,
       }),
-    });
+    }).catch(console.error);
   };
 
-  // Toggle microphone track mute
+  // Setup Broadcaster PeerJS
+  const setupHostPeer = async (stream: MediaStream, meta: Partial<StreamState>) => {
+    try {
+      if (hostPeerRef.current) {
+        hostPeerRef.current.destroy();
+        hostPeerRef.current = null;
+      }
+
+      const PeerClass = await getPeerClass();
+      const hostPeerId = `charon-${roomId}-host`;
+      const peer = new PeerClass(hostPeerId, {
+        config: RTC_CONFIG,
+        debug: 1,
+      });
+      hostPeerRef.current = peer;
+
+      peer.on('open', (id: string) => {
+        console.log('Broadcaster PeerJS registered on cloud:', id);
+      });
+
+      // When viewer connects data connection:
+      peer.on('connection', (conn: any) => {
+        activeConnsRef.current.set(conn.peer, conn);
+
+        conn.on('open', () => {
+          conn.send({
+            type: 'stream-meta',
+            ...meta,
+          });
+
+          // Call viewer with stream
+          const call = peer.call(conn.peer, stream);
+          if (call) {
+            activeCallsRef.current.set(conn.peer, call);
+            call.on('close', () => {
+              activeCallsRef.current.delete(conn.peer);
+            });
+          }
+        });
+
+        conn.on('data', (data: any) => {
+          if (data?.type === 'request-stream') {
+            const call = peer.call(conn.peer, stream);
+            if (call) activeCallsRef.current.set(conn.peer, call);
+          }
+        });
+
+        conn.on('close', () => {
+          activeConnsRef.current.delete(conn.peer);
+        });
+      });
+
+      // When viewer initiates call directly
+      peer.on('call', (call: any) => {
+        call.answer(stream);
+        activeCallsRef.current.set(call.peer, call);
+      });
+
+      peer.on('error', (err: any) => {
+        console.warn('Broadcaster PeerJS warning:', err);
+      });
+    } catch (err) {
+      console.error('Broadcaster PeerJS init error:', err);
+    }
+  };
+
+  // Toggle microphone
   const toggleMicMute = () => {
     if (!captureResult?.micStream) return;
     const audioTrack = captureResult.micStream.getAudioTracks()[0];
@@ -183,7 +286,7 @@ export function LiveStreamStage({
     }
   };
 
-  // VU Meter for host
+  // VU Meter for broadcaster
   useEffect(() => {
     if (!captureResult?.stream) {
       setAudioLevel(0);
@@ -195,197 +298,105 @@ export function LiveStreamStage({
     return cleanup;
   }, [captureResult]);
 
-  // ==========================================
-  // 2. WebRTC Peer Connection Handlers
-  // ==========================================
+  // ============================================================
+  // 2. VIEWER: Connect to Broadcaster via PeerJS & WebRTC
+  // ============================================================
+  const connectToHostPeer = useCallback(async () => {
+    if (isBroadcasting) return;
 
-  // Create PeerConnection for a specific viewer (Host side)
-  const getOrCreateHostPeer = (viewerId: string, stream: MediaStream): RTCPeerConnection => {
-    let pc = peerConnectionsRef.current.get(viewerId);
-    if (pc && pc.signalingState !== 'closed') {
-      return pc;
-    }
-
-    pc = new RTCPeerConnection(RTC_CONFIG);
-    peerConnectionsRef.current.set(viewerId, pc);
-
-    // Add all tracks from screen stream
-    stream.getTracks().forEach((track) => {
-      pc!.addTrack(track, stream);
-    });
-
-    // Send ICE candidate to viewer
-    pc.onicecandidate = (event) => {
-      if (event.candidate) {
-        fetch(`/api/rooms/${roomId}/signal`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            type: 'candidate',
-            senderId: currentUserId,
-            targetId: viewerId,
-            data: event.candidate,
-          }),
-        }).catch(console.error);
-      }
-    };
-
-    return pc;
-  };
-
-  // Send SDP Offer to a viewer (Host side)
-  const sendOfferToViewer = async (viewerId: string, streamOverride?: MediaStream) => {
-    const activeStream = streamOverride || captureResult?.stream;
-    if (!activeStream) return;
     try {
-      const pc = getOrCreateHostPeer(viewerId, activeStream);
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
+      const PeerClass = await getPeerClass();
 
-      await fetch(`/api/rooms/${roomId}/signal`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          type: 'offer',
-          senderId: currentUserId,
-          targetId: viewerId,
-          data: offer,
-        }),
+      if (!viewerPeerRef.current || viewerPeerRef.current.destroyed) {
+        const viewerPeerId = `charon-${roomId}-v-${currentUserId.slice(-5)}-${Math.floor(Math.random() * 9000 + 1000)}`;
+        const peer = new PeerClass(viewerPeerId, {
+          config: RTC_CONFIG,
+          debug: 1,
+        });
+        viewerPeerRef.current = peer;
+
+        peer.on('call', (call: any) => {
+          call.answer(); // Answer without transmitting local media
+
+          call.on('stream', (stream: MediaStream) => {
+            console.log('Viewer received remote screen stream:', stream.getTracks());
+            setRemoteStream(stream);
+            setConnectionStatus('connected');
+            onStreamStateChanged({ isStreaming: true });
+          });
+
+          call.on('close', () => {
+            setRemoteStream(null);
+            setConnectionStatus('disconnected');
+          });
+
+          call.on('error', (err: any) => {
+            console.warn('Viewer call error:', err);
+          });
+        });
+
+        peer.on('error', (err: any) => {
+          if (err?.type === 'peer-unavailable') {
+            setConnectionStatus('disconnected');
+          }
+        });
+      }
+
+      const peer = viewerPeerRef.current;
+      if (!peer || !peer.open) return;
+
+      const hostPeerId = `charon-${roomId}-host`;
+      const conn = peer.connect(hostPeerId, { reliable: true });
+
+      conn.on('open', () => {
+        setConnectionStatus('connecting');
+        conn.send({
+          type: 'viewer-ready',
+          userId: currentUserId,
+          userName: currentUserName,
+        });
       });
-    } catch (err) {
-      console.error(`Error sending offer to viewer ${viewerId}:`, err);
-    }
-  };
 
-  // Setup PeerConnection for Viewer
-  const getOrCreateViewerPeer = (): RTCPeerConnection => {
-    let pc = peerConnectionsRef.current.get('host');
-    if (pc && pc.signalingState !== 'closed') {
-      return pc;
-    }
-
-    pc = new RTCPeerConnection(RTC_CONFIG);
-    peerConnectionsRef.current.set('host', pc);
-
-    pc.ontrack = (event) => {
-      if (event.streams && event.streams[0]) {
-        setRemoteStream(event.streams[0]);
-        setConnectionStatus('connected');
-      }
-    };
-
-    pc.onicecandidate = (event) => {
-      if (event.candidate) {
-        fetch(`/api/rooms/${roomId}/signal`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            type: 'candidate',
-            senderId: currentUserId,
-            targetId: hostId,
-            data: event.candidate,
-          }),
-        }).catch(console.error);
-      }
-    };
-
-    pc.onconnectionstatechange = () => {
-      if (pc?.connectionState === 'connected') {
-        setConnectionStatus('connected');
-      } else if (pc?.connectionState === 'failed' || pc?.connectionState === 'disconnected') {
-        setConnectionStatus('disconnected');
-      }
-    };
-
-    return pc;
-  };
-
-  // Handle incoming SDP Offer (Viewer side)
-  const handleIncomingOffer = async (offer: RTCSessionDescriptionInit, senderId: string) => {
-    try {
-      setConnectionStatus('connecting');
-      const pc = getOrCreateViewerPeer();
-      await pc.setRemoteDescription(new RTCSessionDescription(offer));
-
-      // Process buffered ICE candidates
-      const buffered = pendingCandidatesRef.current.get('host') || [];
-      for (const cand of buffered) {
-        await pc.addIceCandidate(new RTCIceCandidate(cand)).catch(console.error);
-      }
-      pendingCandidatesRef.current.delete('host');
-
-      const answer = await pc.createAnswer();
-      await pc.setLocalDescription(answer);
-
-      await fetch(`/api/rooms/${roomId}/signal`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          type: 'answer',
-          senderId: currentUserId,
-          targetId: senderId,
-          data: answer,
-        }),
-      });
-    } catch (err) {
-      console.error('Error handling incoming offer:', err);
-    }
-  };
-
-  // Handle incoming SDP Answer (Host side)
-  const handleIncomingAnswer = async (answer: RTCSessionDescriptionInit, senderId: string) => {
-    try {
-      const pc = peerConnectionsRef.current.get(senderId);
-      if (pc && pc.signalingState === 'have-local-offer') {
-        await pc.setRemoteDescription(new RTCSessionDescription(answer));
-
-        // Process buffered candidates
-        const buffered = pendingCandidatesRef.current.get(senderId) || [];
-        for (const cand of buffered) {
-          await pc.addIceCandidate(new RTCIceCandidate(cand)).catch(console.error);
+      conn.on('data', (data: any) => {
+        if (data?.type === 'stream-meta') {
+          onStreamStateChanged(data);
+          if (data.isStreaming) {
+            setConnectionStatus('connecting');
+          }
+        } else if (data?.type === 'stream-stopped') {
+          onStreamStateChanged({ isStreaming: false });
+          setRemoteStream(null);
+          setConnectionStatus('disconnected');
         }
-        pendingCandidatesRef.current.delete(senderId);
-      }
+      });
+
+      conn.on('close', () => {
+        setConnectionStatus('disconnected');
+      });
+
+      conn.on('error', () => {
+        setConnectionStatus('disconnected');
+      });
+
     } catch (err) {
-      console.error(`Error setting remote answer for ${senderId}:`, err);
+      console.warn('connectToHostPeer error:', err);
     }
-  };
+  }, [roomId, currentUserId, currentUserName, isBroadcasting, onStreamStateChanged]);
 
-  // Handle incoming ICE Candidate
-  const handleIncomingCandidate = async (candidate: RTCIceCandidateInit, senderId: string) => {
-    const key = isHost ? senderId : 'host';
-    const pc = peerConnectionsRef.current.get(key);
-
-    if (pc && pc.remoteDescription && pc.remoteDescription.type) {
-      await pc.addIceCandidate(new RTCIceCandidate(candidate)).catch(console.error);
-    } else {
-      // Buffer until remote description is set
-      const list = pendingCandidatesRef.current.get(key) || [];
-      list.push(candidate);
-      pendingCandidatesRef.current.set(key, list);
-    }
-  };
-
-  // Viewer requests stream when entering or when host goes live (retries every 2.5s until connected)
+  // Periodic check & connect for viewers
   useEffect(() => {
-    if (isHost || !streamState.isStreaming || connectionStatus === 'connected') return;
+    if (isBroadcasting) return;
 
-    const requestStream = () => {
-      fetch(`/api/rooms/${roomId}/signal`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          type: 'request-stream',
-          senderId: currentUserId,
-          targetId: hostId,
-        }),
-      }).catch(() => {});
-    };
+    connectToHostPeer();
 
-    requestStream();
-    const interval = setInterval(requestStream, 2500);
+    const interval = setInterval(() => {
+      if (!remoteStream && !isBroadcasting) {
+        connectToHostPeer();
+      }
+    }, 2500);
+
     return () => clearInterval(interval);
-  }, [isHost, streamState.isStreaming, connectionStatus, hostId, roomId, currentUserId]);
+  }, [connectToHostPeer, isBroadcasting, remoteStream]);
 
   // Ensure remote stream is attached to video element and starts playing immediately
   useEffect(() => {
@@ -405,9 +416,55 @@ export function LiveStreamStage({
     }
   }, [remoteStream]);
 
-  // ==========================================
-  // 3. Signaling Polling Loop (Every 800ms)
-  // ==========================================
+  // ============================================================
+  // 3. Multi-Tab Local Sync via BroadcastChannel (0ms latency)
+  // ============================================================
+  useEffect(() => {
+    if (typeof window === 'undefined' || !('BroadcastChannel' in window)) return;
+
+    const bc = new BroadcastChannel(`charon_stream_${roomId}`);
+    bcRef.current = bc;
+
+    bc.onmessage = (event) => {
+      const msg = event.data;
+      if (!msg) return;
+
+      if (msg.type === 'stream-started' && !isBroadcasting) {
+        onStreamStateChanged(msg.streamState);
+        connectToHostPeer();
+      } else if (msg.type === 'stream-stopped' && !isBroadcasting) {
+        onStreamStateChanged({ isStreaming: false });
+        setRemoteStream(null);
+        setConnectionStatus('disconnected');
+      } else if (msg.type === 'query-stream' && isBroadcasting && captureResult?.stream) {
+        bc.postMessage({
+          type: 'stream-started',
+          streamState: {
+            isStreaming: true,
+            streamTitle: `${currentUserName}'s Live Screen`,
+            hasAudio: includeAudio,
+            hasMic: includeMic,
+            resolution,
+            startedAt: Date.now(),
+            hostName: currentUserName,
+          },
+        });
+      }
+    };
+
+    if (!isBroadcasting) {
+      bc.postMessage({ type: 'query-stream', senderId: currentUserId });
+    }
+
+    return () => {
+      bc.close();
+      bcRef.current = null;
+    };
+  }, [roomId, isBroadcasting, captureResult, currentUserId, currentUserName, includeAudio, includeMic, resolution, onStreamStateChanged, connectToHostPeer]);
+
+  // ============================================================
+  // 4. Serverless API Polling Fallback (Every 1000ms)
+  // ============================================================
   useEffect(() => {
     let isMounted = true;
 
@@ -417,41 +474,51 @@ export function LiveStreamStage({
         if (!res.ok) return;
 
         const data = await res.json();
-        if (!isMounted || !data.signals) return;
+        if (!isMounted) return;
 
-        for (const sig of data.signals as SignalMessage[]) {
-          if (processedSignalsRef.current.has(sig.id)) continue;
-          processedSignalsRef.current.add(sig.id);
+        // Keep viewer in sync with server streamState
+        if (data.streamState && (!streamState || data.streamState.isStreaming !== streamState.isStreaming)) {
+          onStreamStateChanged(data.streamState);
+        }
 
-          if (sig.type === 'request-stream' && isHost) {
-            // Viewer asked for host stream
-            sendOfferToViewer(sig.senderId);
-          } else if (sig.type === 'offer' && !isHost) {
-            // Viewer received offer from host
-            handleIncomingOffer(sig.data, sig.senderId);
-          } else if (sig.type === 'answer' && isHost) {
-            // Host received answer from viewer
-            handleIncomingAnswer(sig.data, sig.senderId);
-          } else if (sig.type === 'candidate') {
-            handleIncomingCandidate(sig.data, sig.senderId);
-          } else if (sig.type === 'stop' && !isHost) {
-            setRemoteStream(null);
-            setConnectionStatus('disconnected');
+        if (data.signals) {
+          for (const sig of data.signals as SignalMessage[]) {
+            if (processedSignalsRef.current.has(sig.id)) continue;
+            processedSignalsRef.current.add(sig.id);
+
+            if (sig.type === 'stop' && !isBroadcasting) {
+              setRemoteStream(null);
+              setConnectionStatus('disconnected');
+            }
           }
         }
-      } catch (err) {
-        // Silent loop error
-      }
+      } catch {}
     };
 
-    const interval = setInterval(pollSignals, 800);
+    const interval = setInterval(pollSignals, 1000);
     return () => {
       isMounted = false;
       clearInterval(interval);
     };
-  }, [roomId, currentUserId, isHost, captureResult, hostId]);
+  }, [roomId, currentUserId, isBroadcasting, streamState, onStreamStateChanged]);
 
-  // Simulate ultra-low latency jitter (60-95ms)
+  // Manual Check Host button
+  const handleManualCheckHost = async () => {
+    setIsCheckingHost(true);
+    await connectToHostPeer();
+    try {
+      const res = await fetch(`/api/rooms/${roomId}/signal?viewerId=${currentUserId}`);
+      if (res.ok) {
+        const data = await res.json();
+        if (data.streamState) {
+          onStreamStateChanged(data.streamState);
+        }
+      }
+    } catch {}
+    setTimeout(() => setIsCheckingHost(false), 800);
+  };
+
+  // Low latency jitter simulation
   useEffect(() => {
     const timer = setInterval(() => {
       setLatencyMs(Math.floor(65 + Math.random() * 25));
@@ -480,7 +547,7 @@ export function LiveStreamStage({
 
   // Picture in picture
   const togglePictureInPicture = async () => {
-    const video = isHost ? localVideoRef.current : remoteVideoRef.current;
+    const video = isBroadcasting ? localVideoRef.current : remoteVideoRef.current;
     if (!video) return;
 
     try {
@@ -500,15 +567,15 @@ export function LiveStreamStage({
       className="relative w-full aspect-video bg-black rounded-3xl overflow-hidden border border-slate-800 shadow-2xl flex items-center justify-center select-none group"
     >
       {/* Dynamic Backlight Halo */}
-      <AmbientGlow isPlaying={streamState.isStreaming} />
+      <AmbientGlow isPlaying={isBroadcasting || !!remoteStream || streamState.isStreaming} />
 
       {/* Floating Emoji Reactions Barrage */}
       <FloatingReactions reactions={reactions} />
 
       {/* ============================================================== */}
-      {/* CASE 1: HOST IS LIVE STREAMING */}
+      {/* CASE 1: BROADCASTER VIEW (THIS TAB IS LIVE STREAMING) */}
       {/* ============================================================== */}
-      {isHost && captureResult && (
+      {isBroadcasting && (
         <div className="relative w-full h-full flex items-center justify-center bg-black">
           <video
             ref={localVideoRef}
@@ -558,7 +625,7 @@ export function LiveStreamStage({
           <div className="absolute bottom-4 left-1/2 -translate-x-1/2 z-20 flex items-center gap-3 px-5 py-2.5 rounded-2xl bg-slate-900/90 border border-slate-700/80 backdrop-blur-xl shadow-2xl transition-all">
             <button
               onClick={handleStopShare}
-              className="px-4 py-2 rounded-xl text-xs font-bold bg-rose-600 hover:bg-rose-500 text-white flex items-center gap-2 transition-all shadow-md active:scale-95"
+              className="px-4 py-2 rounded-xl text-xs font-bold bg-rose-600 hover:bg-rose-500 text-white flex items-center gap-2 transition-all shadow-md active:scale-95 cursor-pointer"
             >
               <StopCircle className="w-4 h-4" />
               <span>Stop Sharing</span>
@@ -567,7 +634,7 @@ export function LiveStreamStage({
             {includeMic && (
               <button
                 onClick={toggleMicMute}
-                className={`p-2 rounded-xl text-xs font-semibold transition-all ${
+                className={`p-2 rounded-xl text-xs font-semibold transition-all cursor-pointer ${
                   isMicMuted
                     ? 'bg-rose-500/20 text-rose-300 border border-rose-500/40'
                     : 'bg-slate-800 hover:bg-slate-700 text-slate-200'
@@ -580,7 +647,7 @@ export function LiveStreamStage({
 
             <button
               onClick={togglePictureInPicture}
-              className="p-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 transition-all"
+              className="p-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 transition-all cursor-pointer"
               title="Picture in Picture"
             >
               <PictureInPicture className="w-4 h-4" />
@@ -588,7 +655,7 @@ export function LiveStreamStage({
 
             <button
               onClick={toggleFullscreen}
-              className="p-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 transition-all"
+              className="p-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 transition-all cursor-pointer"
               title="Fullscreen"
             >
               {isFullscreen ? <Minimize2 className="w-4 h-4" /> : <Maximize2 className="w-4 h-4" />}
@@ -598,92 +665,9 @@ export function LiveStreamStage({
       )}
 
       {/* ============================================================== */}
-      {/* CASE 2: HOST IS NOT STREAMING YET (HOST VIEWPORT) */}
+      {/* CASE 2: VIEWER WATCHING LIVE STREAM */}
       {/* ============================================================== */}
-      {isHost && !captureResult && (
-        <div className="relative z-10 max-w-lg w-full p-6 text-center space-y-5 animate-fade-in">
-          <div className="inline-flex items-center justify-center w-16 h-16 rounded-3xl bg-brand-500/10 border border-brand-500/30 text-brand-400 shadow-xl shadow-brand-500/10">
-            <RadioTower className="w-8 h-8 animate-pulse" />
-          </div>
-
-          <div>
-            <h2 className="text-xl font-black text-white tracking-tight">
-              Ready to Stream, {currentUserName}?
-            </h2>
-            <p className="text-xs text-slate-400 mt-1 max-w-sm mx-auto">
-              Share your entire screen, an application window, or a browser tab with friends in ultra-low latency.
-            </p>
-          </div>
-
-          {/* Stream Configuration Options */}
-          <div className="p-4 rounded-2xl bg-cinema-850/80 border border-slate-800/80 text-left space-y-3">
-            {/* Resolution selector */}
-            <div className="flex items-center justify-between text-xs">
-              <span className="font-semibold text-slate-300 flex items-center gap-1.5">
-                <Layers className="w-3.5 h-3.5 text-brand-400" />
-                Stream Resolution
-              </span>
-              <div className="flex items-center gap-1 bg-cinema-950 p-1 rounded-xl border border-slate-800">
-                {(['720p', '1080p', '4k'] as const).map((res) => (
-                  <button
-                    key={res}
-                    onClick={() => setResolution(res)}
-                    className={`px-2.5 py-0.5 rounded-lg font-mono text-[10px] font-bold uppercase transition-all ${
-                      resolution === res
-                        ? 'bg-brand-500 text-white shadow-xs'
-                        : 'text-slate-400 hover:text-white'
-                    }`}
-                  >
-                    {res}
-                  </button>
-                ))}
-              </div>
-            </div>
-
-            {/* Audio Toggle */}
-            <label className="flex items-center justify-between text-xs cursor-pointer select-none">
-              <span className="text-slate-300 flex items-center gap-1.5">
-                <Volume2 className="w-3.5 h-3.5 text-cyan-400" />
-                Share System Audio (Games & Video)
-              </span>
-              <input
-                type="checkbox"
-                checked={includeAudio}
-                onChange={(e) => setIncludeAudio(e.target.checked)}
-                className="w-4 h-4 rounded text-brand-500 focus:ring-brand-500 border-slate-700 bg-slate-800"
-              />
-            </label>
-
-            {/* Mic Toggle */}
-            <label className="flex items-center justify-between text-xs cursor-pointer select-none">
-              <span className="text-slate-300 flex items-center gap-1.5">
-                <Mic className="w-3.5 h-3.5 text-emerald-400" />
-                Include Microphone Commentary
-              </span>
-              <input
-                type="checkbox"
-                checked={includeMic}
-                onChange={(e) => setIncludeMic(e.target.checked)}
-                className="w-4 h-4 rounded text-brand-500 focus:ring-brand-500 border-slate-700 bg-slate-800"
-              />
-            </label>
-          </div>
-
-          {/* Go Live Button */}
-          <button
-            onClick={handleStartShare}
-            className="w-full py-3.5 rounded-2xl bg-gradient-to-r from-brand-600 via-indigo-600 to-cyan-600 hover:from-brand-500 hover:to-cyan-500 text-white font-bold text-sm shadow-xl shadow-brand-500/20 active:scale-98 transition-all flex items-center justify-center gap-2 cursor-pointer"
-          >
-            <Radio className="w-4 h-4 animate-ping" />
-            <span>Start Live Screen Share</span>
-          </button>
-        </div>
-      )}
-
-      {/* ============================================================== */}
-      {/* CASE 3: VIEWER WATCHING LIVE STREAM */}
-      {/* ============================================================== */}
-      {!isHost && streamState.isStreaming && (
+      {!isBroadcasting && (remoteStream || streamState.isStreaming) && (
         <div className="relative w-full h-full flex items-center justify-center bg-black">
           <video
             ref={remoteVideoRef}
@@ -692,14 +676,22 @@ export function LiveStreamStage({
             className="w-full h-full object-contain"
           />
 
-          {/* If video stream is connecting / buffering */}
+          {/* If video stream is negotiating / connecting */}
           {!remoteStream && (
-            <div className="absolute inset-0 flex flex-col items-center justify-center bg-cinema-950/95 z-10 space-y-3 animate-fade-in">
+            <div className="absolute inset-0 flex flex-col items-center justify-center bg-cinema-950/95 z-10 space-y-3 animate-fade-in p-6">
               <div className="w-10 h-10 border-3 border-brand-500 border-t-transparent rounded-full animate-spin" />
               <div className="text-center space-y-1">
                 <p className="text-sm font-bold text-white">Connecting to {streamState.hostName || 'Host'}&apos;s Live Screen</p>
                 <p className="text-xs text-slate-400 font-mono">Negotiating peer-to-peer WebRTC connection...</p>
               </div>
+              <button
+                onClick={handleManualCheckHost}
+                disabled={isCheckingHost}
+                className="mt-2 px-3.5 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-slate-300 flex items-center gap-1.5 transition-all cursor-pointer border border-slate-700"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${isCheckingHost ? 'animate-spin text-brand-400' : ''}`} />
+                <span>{isCheckingHost ? 'Connecting...' : 'Reconnect Now'}</span>
+              </button>
             </div>
           )}
 
@@ -745,7 +737,7 @@ export function LiveStreamStage({
             <div className="flex items-center gap-2">
               <button
                 onClick={() => setIsMuted(!isMuted)}
-                className="p-1.5 rounded-lg text-slate-300 hover:text-white hover:bg-slate-800 transition-colors"
+                className="p-1.5 rounded-lg text-slate-300 hover:text-white hover:bg-slate-800 transition-colors cursor-pointer"
               >
                 {isMuted || volume === 0 ? <VolumeX className="w-4 h-4 text-rose-400" /> : <Volume2 className="w-4 h-4" />}
               </button>
@@ -767,14 +759,14 @@ export function LiveStreamStage({
             <div className="flex items-center gap-2">
               <button
                 onClick={togglePictureInPicture}
-                className="p-1.5 rounded-lg text-slate-300 hover:text-white hover:bg-slate-800 transition-colors"
+                className="p-1.5 rounded-lg text-slate-300 hover:text-white hover:bg-slate-800 transition-colors cursor-pointer"
                 title="Picture in Picture"
               >
                 <PictureInPicture className="w-4 h-4" />
               </button>
               <button
                 onClick={toggleFullscreen}
-                className="p-1.5 rounded-lg text-slate-300 hover:text-white hover:bg-slate-800 transition-colors"
+                className="p-1.5 rounded-lg text-slate-300 hover:text-white hover:bg-slate-800 transition-colors cursor-pointer"
                 title="Fullscreen"
               >
                 {isFullscreen ? <Minimize2 className="w-4 h-4" /> : <Maximize2 className="w-4 h-4" />}
@@ -785,31 +777,117 @@ export function LiveStreamStage({
       )}
 
       {/* ============================================================== */}
-      {/* CASE 4: VIEWER WAITING FOR HOST TO GO LIVE */}
+      {/* CASE 3: STANDBY LOUNGE (WAITING FOR BROADCAST / SHARE YOUR SCREEN) */}
       {/* ============================================================== */}
-      {!isHost && !streamState.isStreaming && (
+      {!isBroadcasting && !remoteStream && !streamState.isStreaming && (
         <div className="relative z-10 max-w-md w-full p-6 text-center space-y-4 animate-fade-in">
           {/* Pulsing Radar Ring */}
           <div className="relative inline-flex items-center justify-center w-20 h-20">
             <div className="absolute inset-0 rounded-full bg-brand-500/20 animate-ping opacity-60" />
             <div className="absolute inset-2 rounded-full bg-brand-500/10 animate-pulse" />
             <div className="relative w-14 h-14 rounded-2xl bg-cinema-850 border border-brand-500/30 text-brand-400 flex items-center justify-center shadow-xl">
-              <Monitor className="w-7 h-7" />
+              <RadioTower className="w-7 h-7" />
             </div>
           </div>
 
           <div>
-            <h2 className="text-lg font-black text-white">
-              Waiting for Host to Go Live
+            <h2 className="text-lg sm:text-xl font-black text-white">
+              {isHost ? `Ready to Stream, ${currentUserName}?` : 'Waiting for Host to Go Live'}
             </h2>
             <p className="text-xs text-slate-400 mt-1 max-w-xs mx-auto">
-              {streamState.hostName || 'The host'} has not started sharing their screen yet. The stream will begin automatically once they go live!
+              {isHost
+                ? 'Share your screen, an app window, or a browser tab with high quality and system audio.'
+                : `${streamState.hostName || 'The host'} has not started sharing yet. The stream will begin automatically once live, or you can go live yourself!`}
             </p>
           </div>
 
-          <div className="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full text-xs font-mono bg-cinema-850/80 border border-slate-800 text-slate-300">
+          {/* Stream Settings Accordion (if user toggles or if host) */}
+          {(showConfig || isHost) && (
+            <div className="p-3.5 rounded-2xl bg-cinema-850/80 border border-slate-800/80 text-left space-y-2.5 animate-fade-in">
+              <div className="flex items-center justify-between text-xs">
+                <span className="font-semibold text-slate-300 flex items-center gap-1.5">
+                  <Layers className="w-3.5 h-3.5 text-brand-400" />
+                  Resolution
+                </span>
+                <div className="flex items-center gap-1 bg-cinema-950 p-1 rounded-xl border border-slate-800">
+                  {(['720p', '1080p', '4k'] as const).map((res) => (
+                    <button
+                      key={res}
+                      onClick={() => setResolution(res)}
+                      className={`px-2 py-0.5 rounded-lg font-mono text-[10px] font-bold uppercase transition-all cursor-pointer ${
+                        resolution === res
+                          ? 'bg-brand-500 text-white shadow-xs'
+                          : 'text-slate-400 hover:text-white'
+                      }`}
+                    >
+                      {res}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <label className="flex items-center justify-between text-xs cursor-pointer select-none">
+                <span className="text-slate-300 flex items-center gap-1.5">
+                  <Volume2 className="w-3.5 h-3.5 text-cyan-400" />
+                  System Audio (Games & Video)
+                </span>
+                <input
+                  type="checkbox"
+                  checked={includeAudio}
+                  onChange={(e) => setIncludeAudio(e.target.checked)}
+                  className="w-4 h-4 rounded text-brand-500 focus:ring-brand-500 border-slate-700 bg-slate-800 cursor-pointer"
+                />
+              </label>
+
+              <label className="flex items-center justify-between text-xs cursor-pointer select-none">
+                <span className="text-slate-300 flex items-center gap-1.5">
+                  <Mic className="w-3.5 h-3.5 text-emerald-400" />
+                  Microphone Commentary
+                </span>
+                <input
+                  type="checkbox"
+                  checked={includeMic}
+                  onChange={(e) => setIncludeMic(e.target.checked)}
+                  className="w-4 h-4 rounded text-brand-500 focus:ring-brand-500 border-slate-700 bg-slate-800 cursor-pointer"
+                />
+              </label>
+            </div>
+          )}
+
+          {/* Action Buttons */}
+          <div className="flex flex-col sm:flex-row items-center justify-center gap-2.5 pt-1">
+            <button
+              onClick={handleStartShare}
+              className="w-full sm:w-auto px-5 py-3 rounded-2xl bg-gradient-to-r from-brand-600 via-indigo-600 to-cyan-600 hover:from-brand-500 hover:to-cyan-500 text-white font-bold text-xs shadow-xl shadow-brand-500/20 active:scale-98 transition-all flex items-center justify-center gap-2 cursor-pointer"
+            >
+              <Radio className="w-4 h-4" />
+              <span>{isHost ? 'Start Live Screen Share' : 'Share My Screen Instead'}</span>
+            </button>
+
+            {!isHost && !showConfig && (
+              <button
+                onClick={() => setShowConfig(true)}
+                className="px-3.5 py-3 rounded-2xl bg-slate-800/80 hover:bg-slate-700/80 text-slate-300 hover:text-white text-xs font-semibold transition-all border border-slate-700/60 cursor-pointer"
+              >
+                Settings
+              </button>
+            )}
+
+            {!isHost && (
+              <button
+                onClick={handleManualCheckHost}
+                disabled={isCheckingHost}
+                className="w-full sm:w-auto px-4 py-3 rounded-2xl bg-slate-800/80 hover:bg-slate-700/80 text-slate-300 hover:text-white text-xs font-semibold transition-all border border-slate-700/60 flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-50"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${isCheckingHost ? 'animate-spin text-brand-400' : ''}`} />
+                <span>{isCheckingHost ? 'Checking...' : 'Check Host Status'}</span>
+              </button>
+            )}
+          </div>
+
+          <div className="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full text-[11px] font-mono bg-cinema-850/80 border border-slate-800 text-slate-400">
             <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse" />
-            <span>Room #{roomId} Standby Mode</span>
+            <span>Room #{roomId} Standby Mode • P2P Mesh Active</span>
           </div>
         </div>
       )}

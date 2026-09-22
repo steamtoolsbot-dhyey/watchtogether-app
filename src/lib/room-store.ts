@@ -139,7 +139,9 @@ export function updateRoomViewer(roomId: string, viewer: RoomViewer): RoomData |
   const isPreviousHostActive = room.hostId && room.hostId !== 'host' && room.viewers[room.hostId];
   if (!isPreviousHostActive) {
     room.hostId = viewer.id;
-    room.streamState.hostName = viewer.name;
+    if (!room.streamState.isStreaming) {
+      room.streamState.hostName = viewer.name;
+    }
     room.viewers[viewer.id].isHost = true;
   } else {
     room.viewers[viewer.id].isHost = (room.hostId === viewer.id);

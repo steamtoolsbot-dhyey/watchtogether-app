@@ -54,12 +54,20 @@ export default function CinemaRoomPage() {
 
     let isSubscribed = true;
 
+    // Check if creator role is specified in URL or sessionStorage
+    const isUrlHost = typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('role') === 'host';
+    if (isUrlHost) {
+      sessionStorage.setItem(`cw_host_${roomId}`, 'true');
+    }
+    const isStoredHost = typeof window !== 'undefined' && sessionStorage.getItem(`cw_host_${roomId}`) === 'true';
+
     async function fetchRoomSync() {
       try {
         const query = new URLSearchParams({
           viewerId: userId,
           viewerName: userName,
           avatarColor: userColor,
+          ...(isStoredHost ? { claimHost: 'true' } : {}),
         });
 
         const res = await fetch(`/api/rooms/${roomId}?${query.toString()}`);
@@ -264,7 +272,8 @@ export default function CinemaRoomPage() {
     );
   }
 
-  const isHost = room.hostId === userId;
+  const isStoredHost = typeof window !== 'undefined' && sessionStorage.getItem(`cw_host_${roomId}`) === 'true';
+  const isHost = isStoredHost || (room.hostId === userId);
 
   return (
     <div className="min-h-screen flex flex-col bg-cinema-950 text-slate-100">

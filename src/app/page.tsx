@@ -31,13 +31,13 @@ export default function HomePage() {
       });
       const data = await res.json();
       if (data.success && data.roomId) {
-        router.push(`/room/${data.roomId}`);
+        router.push(`/room/${data.roomId}?role=host`);
       }
     } catch (err) {
       console.error('Failed to create room:', err);
       // Fallback local slug
       const fallbackId = `cinema-${Math.random().toString(36).substring(2, 7)}`;
-      router.push(`/room/${fallbackId}`);
+      router.push(`/room/${fallbackId}?role=host`);
     } finally {
       setIsCreating(false);
     }

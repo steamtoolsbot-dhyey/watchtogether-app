@@ -8,8 +8,16 @@ export async function GET(req: NextRequest, { params }: { params: { roomId: stri
   const viewerName = searchParams.get('viewerName');
   const avatarColor = searchParams.get('avatarColor') || '#8b5cf6';
   const isBuffering = searchParams.get('isBuffering') === 'true';
+  const claimHost = searchParams.get('claimHost') === 'true';
 
   const room = getOrCreateRoom(roomId);
+
+  if (claimHost && viewerId) {
+    room.hostId = viewerId;
+    if (!room.streamState.isStreaming && viewerName) {
+      room.streamState.hostName = viewerName;
+    }
+  }
 
   // Record presence heartbeat if viewer parameters provided
   if (viewerId && viewerName) {
