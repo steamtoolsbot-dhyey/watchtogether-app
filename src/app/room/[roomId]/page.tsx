@@ -2,12 +2,13 @@
 
 import React, { useEffect, useState, useRef } from 'react';
 import { useParams } from 'next/navigation';
-import { RoomData, PlaylistItem, PlaybackState, ChatMessage, EmojiReaction } from '@/lib/types';
+import { RoomData, PlaylistItem, PlaybackState, ChatMessage, EmojiReaction, StreamState } from '@/lib/types';
 import { RoomHeader } from '@/components/room/RoomHeader';
 import { VideoPlayer } from '@/components/player/VideoPlayer';
+import { LiveStreamStage } from '@/components/streaming/LiveStreamStage';
 import { RoomChat } from '@/components/chat/RoomChat';
 import { RoomPlaylist } from '@/components/playlist/RoomPlaylist';
-import { MessageSquare, ListVideo, Loader2, ShieldCheck, Film } from 'lucide-react';
+import { MessageSquare, ListVideo, Loader2, ShieldCheck, Film, Monitor, Tv, Radio } from 'lucide-react';
 
 const AVATAR_COLORS = ['#8b5cf6', '#ec4899', '#3b82f6', '#10b981', '#f59e0b', '#06b6d4', '#f43f5e'];
 
@@ -17,6 +18,7 @@ export default function CinemaRoomPage() {
 
   const [room, setRoom] = useState<RoomData | null>(null);
   const [activeTab, setActiveTab] = useState<'chat' | 'playlist'>('chat');
+  const [viewMode, setViewMode] = useState<'screen' | 'video'>('screen');
   const [userId, setUserId] = useState<string>('');
   const [userName, setUserName] = useState<string>('');
   const [userColor, setUserColor] = useState<string>(AVATAR_COLORS[0]);
@@ -228,6 +230,26 @@ export default function CinemaRoomPage() {
     }
   };
 
+  // Auto-switch to screen view when host goes live
+  useEffect(() => {
+    if (room?.streamState?.isStreaming) {
+      setViewMode('screen');
+    }
+  }, [room?.streamState?.isStreaming]);
+
+  const handleStreamStateChanged = (update: Partial<StreamState>) => {
+    setRoom((prev) => {
+      if (!prev) return prev;
+      return {
+        ...prev,
+        streamState: {
+          ...prev.streamState,
+          ...update,
+        },
+      };
+    });
+  };
+
   const handleUpdateUserName = (newName: string) => {
     setUserName(newName);
     localStorage.setItem('cw_user_name', newName);
@@ -258,29 +280,95 @@ export default function CinemaRoomPage() {
 
       {/* Main Cinema Grid */}
       <main className="flex-1 p-3 sm:p-5 max-w-[1600px] w-full mx-auto grid grid-cols-1 lg:grid-cols-12 gap-5">
-        {/* Left Column: Player & Info (8 Cols on Desktop) */}
+        {/* Left Column: Streaming Stage / Player & Info (8 Cols on Desktop) */}
         <div className="lg:col-span-8 flex flex-col gap-4">
-          <VideoPlayer
-            currentVideo={room.currentVideo}
-            playbackState={room.playback}
-            isHost={isHost}
-            hostOnlyControls={room.hostOnlyControls}
-            reactions={room.reactions}
-            onPlaybackChange={handlePlaybackChange}
-            onVideoEnded={handleNextVideo}
-          />
+          {/* Mode Switcher Bar */}
+          <div className="flex items-center justify-between p-1.5 rounded-2xl bg-cinema-900 border border-slate-800/80">
+            <div className="flex items-center gap-1.5">
+              <button
+                onClick={() => setViewMode('screen')}
+                className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all flex items-center gap-2 cursor-pointer ${
+                  viewMode === 'screen'
+                    ? 'bg-brand-600 text-white shadow-sm'
+                    : 'text-slate-400 hover:text-white hover:bg-slate-800/60'
+                }`}
+              >
+                <Monitor className="w-3.5 h-3.5" />
+                <span>Live Screen Share</span>
+                {room.streamState?.isStreaming && (
+                  <span className="flex items-center gap-1 px-1.5 py-0.2 rounded-full text-[9px] bg-rose-500 text-white animate-pulse">
+                    <span className="w-1.5 h-1.5 rounded-full bg-white animate-ping" />
+                    LIVE
+                  </span>
+                )}
+              </button>
 
-          {/* Current Video Details Card */}
+              <button
+                onClick={() => setViewMode('video')}
+                className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all flex items-center gap-2 cursor-pointer ${
+                  viewMode === 'video'
+                    ? 'bg-brand-600 text-white shadow-sm'
+                    : 'text-slate-400 hover:text-white hover:bg-slate-800/60'
+                }`}
+              >
+                <Film className="w-3.5 h-3.5" />
+                <span>Synced Video Player</span>
+              </button>
+            </div>
+
+            <div className="hidden sm:flex items-center gap-2 text-[11px] font-mono text-slate-400 pr-2">
+              <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+              <span>WebRTC Mesh Active</span>
+            </div>
+          </div>
+
+          {/* Primary Viewport */}
+          {viewMode === 'screen' ? (
+            <LiveStreamStage
+              roomId={room.id}
+              isHost={isHost}
+              currentUserId={userId}
+              currentUserName={userName}
+              hostId={room.hostId}
+              streamState={room.streamState}
+              reactions={room.reactions}
+              onStreamStateChanged={handleStreamStateChanged}
+            />
+          ) : (
+            <VideoPlayer
+              currentVideo={room.currentVideo}
+              playbackState={room.playback}
+              isHost={isHost}
+              hostOnlyControls={room.hostOnlyControls}
+              reactions={room.reactions}
+              onPlaybackChange={handlePlaybackChange}
+              onVideoEnded={handleNextVideo}
+            />
+          )}
+
+          {/* Stream & Room Info Details Card */}
           <div className="p-4 rounded-3xl bg-cinema-900 border border-slate-800/80 shadow-md flex flex-col sm:flex-row sm:items-center justify-between gap-3">
             <div className="min-w-0">
-              <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-brand-500/15 text-brand-300 border border-brand-500/30 uppercase font-bold">
-                {room.currentVideo?.type || 'Stream'} Source
-              </span>
+              <div className="flex items-center gap-2">
+                <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-brand-500/15 text-brand-300 border border-brand-500/30 uppercase font-bold">
+                  {viewMode === 'screen' ? (room.streamState?.isStreaming ? 'Live Broadcast' : 'Screen Share') : (room.currentVideo?.type || 'Stream')}
+                </span>
+                {viewMode === 'screen' && room.streamState?.isStreaming && (
+                  <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-rose-500/15 text-rose-300 border border-rose-500/30 font-bold">
+                    {room.streamState?.resolution || '1080p'} 60fps
+                  </span>
+                )}
+              </div>
+
               <h2 className="text-base sm:text-lg font-black text-white mt-1 truncate">
-                {room.currentVideo?.title || 'No video loaded'}
+                {viewMode === 'screen'
+                  ? (room.streamState?.isStreaming ? room.streamState?.streamTitle : `${room.name} — Live Lounge`)
+                  : (room.currentVideo?.title || 'No video loaded')}
               </h2>
               <p className="text-xs text-slate-400 truncate mt-0.5 font-mono">
-                {room.currentVideo?.url}
+                {viewMode === 'screen'
+                  ? `Host: ${isHost ? 'You (Broadcaster)' : room.streamState?.hostName || 'Room Host'}`
+                  : room.currentVideo?.url}
               </p>
             </div>
 
@@ -289,7 +377,7 @@ export default function CinemaRoomPage() {
               <ShieldCheck className="w-4 h-4 text-emerald-400" />
               <div className="text-[11px] leading-tight">
                 <span className="font-bold block">100% Anti-Torrent</span>
-                <span className="text-emerald-400/80">Authorized Streams</span>
+                <span className="text-emerald-400/80">DTLS P2P Streams</span>
               </div>
             </div>
           </div>

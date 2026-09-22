@@ -104,13 +104,13 @@ export default function HomePage() {
         {/* Hero Title */}
         <div className="space-y-4 max-w-3xl">
           <h1 className="text-4xl sm:text-6xl font-black tracking-tight leading-[1.15]">
-            Watch streams together in{' '}
-            <span className="bg-gradient-to-r from-brand-400 via-fuchsia-400 to-amber-300 bg-clip-text text-transparent">
-              perfect real-time sync.
+            Share your screen & stream live in{' '}
+            <span className="bg-gradient-to-r from-brand-400 via-fuchsia-400 to-cyan-400 bg-clip-text text-transparent">
+              sub-second sync.
             </span>
           </h1>
           <p className="text-sm sm:text-base text-slate-300 max-w-2xl mx-auto leading-relaxed">
-            Create a private virtual cinema room in seconds. Synchronize YouTube, Twitch, and direct HTTPS video streams with friends worldwide with zero lag, floating live reactions, and military-grade End-to-End Encryption.
+            Host a private live stream lounge in seconds. Broadcast your entire monitor, gaming apps, or browser tabs directly to friends with ultra-low WebRTC latency, system audio, microphone commentary, and client-side End-to-End Encryption.
           </p>
         </div>
 
@@ -119,16 +119,16 @@ export default function HomePage() {
           <button
             onClick={handleCreateRoom}
             disabled={isCreating}
-            className="w-full py-4 rounded-2xl bg-gradient-to-r from-brand-600 via-brand-500 to-fuchsia-600 hover:opacity-95 active:scale-98 text-white font-black text-sm shadow-xl shadow-brand-600/30 transition-all flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50"
+            className="w-full py-4 rounded-2xl bg-gradient-to-r from-brand-600 via-indigo-600 to-cyan-600 hover:opacity-95 active:scale-98 text-white font-black text-sm shadow-xl shadow-brand-600/30 transition-all flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50"
           >
-            <Play className="w-4 h-4 fill-white" />
-            <span>{isCreating ? 'Launching Cinema...' : 'Create Instant Room'}</span>
+            <Sparkles className="w-4 h-4 fill-white" />
+            <span>{isCreating ? 'Launching Stream Lounge...' : 'Start Live Stream Room'}</span>
           </button>
 
           <div className="relative flex items-center justify-center">
             <div className="border-t border-slate-800 w-full" />
             <span className="bg-cinema-900 px-3 text-xs font-mono text-slate-500 uppercase">
-              Or join existing room
+              Or join existing lounge
             </span>
           </div>
 
@@ -137,7 +137,7 @@ export default function HomePage() {
               type="text"
               value={roomCodeInput}
               onChange={(e) => setRoomCodeInput(e.target.value)}
-              placeholder="Enter room code (e.g. cinema-882)..."
+              placeholder="Enter room code (e.g. stream-904)..."
               className="flex-1 bg-slate-950 border border-slate-800 focus:border-brand-500 rounded-xl px-3 py-2.5 text-xs text-white placeholder-slate-500 outline-none font-mono"
             />
             <button
@@ -155,13 +155,13 @@ export default function HomePage() {
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 w-full max-w-4xl text-left pt-6">
           <div className="p-5 rounded-3xl bg-cinema-900/60 border border-slate-800/60 space-y-2">
             <div className="w-8 h-8 rounded-xl bg-brand-500/10 text-brand-400 flex items-center justify-center">
-              <Tv className="w-4 h-4" />
+              <Zap className="w-4 h-4" />
             </div>
             <h3 className="text-xs font-bold uppercase tracking-wider font-mono text-slate-200">
-              Universal Player
+              WebRTC Screen Share
             </h3>
             <p className="text-xs text-slate-400 leading-relaxed">
-              Native synchronization for YouTube, Twitch live broadcasts, and direct HTTPS video streams (.mp4, .webm, .m3u8).
+              Broadcast screens, apps, or browser tabs at 1080p 60fps with sub-100ms ultra-low latency directly to viewers.
             </p>
           </div>
 
@@ -173,7 +173,7 @@ export default function HomePage() {
               User-End Encryption
             </h3>
             <p className="text-xs text-slate-400 leading-relaxed">
-              Every chat message and room signal is encrypted in your browser using AES-GCM-256. The server never sees your messages.
+              Every stream track is encrypted with DTLS-SRTP, and chat is protected via client-side AES-GCM-256 Web Crypto.
             </p>
           </div>
 
@@ -185,7 +185,7 @@ export default function HomePage() {
               Zero Torrents
             </h3>
             <p className="text-xs text-slate-400 leading-relaxed">
-              100% torrent-free. Magnet swarms and P2P torrent protocols are strictly blocked for maximum security and compliance.
+              100% torrent-free. Magnet links, .torrent files, and P2P swarm trackers are strictly blocked by protocol.
             </p>
           </div>
         </div>

@@ -46,12 +46,34 @@ export interface RoomViewer {
   lastSeen: number;
 }
 
+export interface StreamState {
+  isStreaming: boolean;
+  streamType: 'screen' | 'camera' | 'hybrid';
+  streamTitle: string;
+  hasAudio: boolean;
+  hasMic: boolean;
+  resolution: '1080p' | '720p' | '4k';
+  startedAt?: number;
+  hostName: string;
+}
+
+export interface SignalMessage {
+  id: string;
+  type: 'offer' | 'answer' | 'candidate' | 'stop' | 'request-stream';
+  senderId: string;
+  targetId?: string; // If undefined, broadcast to all
+  data: any;
+  timestamp: number;
+}
+
 export interface RoomData {
   id: string;
   name: string;
   createdAt: number;
   hostId: string;
   hostOnlyControls: boolean;
+  streamState: StreamState;
+  signals: SignalMessage[];
   currentVideo: PlaylistItem | null;
   playback: PlaybackState;
   queue: PlaylistItem[];
@@ -59,3 +81,4 @@ export interface RoomData {
   reactions: EmojiReaction[];
   viewers: Record<string, RoomViewer>;
 }
+
