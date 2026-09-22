@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useEffect, useState, useRef } from 'react';
+import React, { useEffect, useState, useRef, useCallback } from 'react';
 import { useParams } from 'next/navigation';
 import { RoomData, PlaylistItem, PlaybackState, ChatMessage, EmojiReaction, StreamState } from '@/lib/types';
 import { RoomHeader } from '@/components/room/RoomHeader';
@@ -245,7 +245,7 @@ export default function CinemaRoomPage() {
     }
   }, [room?.streamState?.isStreaming]);
 
-  const handleStreamStateChanged = (update: Partial<StreamState>) => {
+  const handleStreamStateChanged = useCallback((update: Partial<StreamState>) => {
     setRoom((prev) => {
       if (!prev) return prev;
       return {
@@ -256,7 +256,7 @@ export default function CinemaRoomPage() {
         },
       };
     });
-  };
+  }, []);
 
   const handleUpdateUserName = (newName: string) => {
     setUserName(newName);

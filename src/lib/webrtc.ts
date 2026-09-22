@@ -8,17 +8,75 @@
  * 4. Google STUN configuration for NAT traversal
  */
 
+export const METERED_OPENRELAY_SERVERS: RTCIceServer[] = [
+  { urls: 'stun:stun.l.google.com:19302' },
+  { urls: 'stun:stun1.l.google.com:19302' },
+  { urls: 'stun:stun2.l.google.com:19302' },
+  { urls: 'stun:stun.cloudflare.com:3478' },
+  // Metered.ca Open Relay STUN & TURN Servers (UDP, TCP, and TLS/TURNS for strict firewall traversal)
+  { urls: 'stun:openrelay.metered.ca:80' },
+  {
+    urls: 'turn:openrelay.metered.ca:80',
+    username: 'openrelayproject',
+    credential: 'openrelayproject',
+  },
+  {
+    urls: 'turn:openrelay.metered.ca:443',
+    username: 'openrelayproject',
+    credential: 'openrelayproject',
+  },
+  {
+    urls: 'turn:openrelay.metered.ca:443?transport=tcp',
+    username: 'openrelayproject',
+    credential: 'openrelayproject',
+  },
+  {
+    urls: 'turns:openrelay.metered.ca:443?transport=tcp',
+    username: 'openrelayproject',
+    credential: 'openrelayproject',
+  },
+];
+
 export const RTC_CONFIG: RTCConfiguration = {
-  iceServers: [
-    { urls: 'stun:stun.l.google.com:19302' },
-    { urls: 'stun:stun1.l.google.com:19302' },
-    { urls: 'stun:stun2.l.google.com:19302' },
-    { urls: 'stun:stun3.l.google.com:19302' },
-    { urls: 'stun:stun4.l.google.com:19302' },
-    { urls: 'stun:stun.cloudflare.com:3478' },
-  ],
+  iceServers: METERED_OPENRELAY_SERVERS,
   iceCandidatePoolSize: 10,
 };
+
+let cachedRTCConfig: RTCConfiguration | null = null;
+let lastFetchTime = 0;
+
+/**
+ * Dynamically resolves RTCConfiguration with Metered.ca TURN credentials.
+ * Fetches fresh credentials from /api/turn-credentials if available,
+ * or falls back seamlessly to the built-in Metered Open Relay servers.
+ */
+export async function getRTCConfig(): Promise<RTCConfiguration> {
+  const now = Date.now();
+  if (cachedRTCConfig && now - lastFetchTime < 30 * 60 * 1000) {
+    return cachedRTCConfig;
+  }
+
+  try {
+    if (typeof window !== 'undefined') {
+      const res = await fetch('/api/turn-credentials', { cache: 'no-store' });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.iceServers && Array.isArray(data.iceServers) && data.iceServers.length > 0) {
+          cachedRTCConfig = {
+            iceServers: data.iceServers,
+            iceCandidatePoolSize: 10,
+          };
+          lastFetchTime = now;
+          return cachedRTCConfig;
+        }
+      }
+    }
+  } catch (err) {
+    console.warn('[WebRTC] Dynamic TURN fetch fallback to built-in Metered config:', err);
+  }
+
+  return RTC_CONFIG;
+}
 
 /**
  * Creates a silent, ultra-lightweight dummy MediaStream with 1x1 black canvas
