@@ -135,10 +135,14 @@ export function updateRoomViewer(roomId: string, viewer: RoomViewer): RoomData |
     lastSeen: Date.now(),
   };
 
-  // If room host left or hasn't been seen, promote first active viewer
-  if (!room.viewers[room.hostId]) {
+  // Set hostId to the first viewer if empty, 'host', or if previous host disconnected (>20s)
+  const isPreviousHostActive = room.hostId && room.hostId !== 'host' && room.viewers[room.hostId];
+  if (!isPreviousHostActive) {
     room.hostId = viewer.id;
+    room.streamState.hostName = viewer.name;
     room.viewers[viewer.id].isHost = true;
+  } else {
+    room.viewers[viewer.id].isHost = (room.hostId === viewer.id);
   }
 
   return room;
@@ -219,11 +223,12 @@ export function getRoomSignals(roomId: string, viewerId: string, since?: number)
   const room = rooms.get(roomId);
   if (!room || !room.signals) return [];
 
-  const minTime = since || Date.now() - 15000;
+  // Default to signals in the last 30 seconds
+  const minTime = since ? since - 2000 : Date.now() - 30000;
   return room.signals.filter((s) => {
     // Deliver if signal is addressed to viewerId or broadcast (no targetId) AND not sent by self
     const isTarget = (!s.targetId || s.targetId === viewerId) && s.senderId !== viewerId;
-    return isTarget && s.timestamp > minTime;
+    return isTarget && s.timestamp >= minTime;
   });
 }
 

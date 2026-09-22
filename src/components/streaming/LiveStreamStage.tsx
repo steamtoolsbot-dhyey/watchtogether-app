@@ -39,6 +39,7 @@ interface LiveStreamStageProps {
   hostId: string;
   streamState: StreamState;
   reactions: EmojiReaction[];
+  viewers?: Record<string, any>;
   onStreamStateChanged: (update: Partial<StreamState>) => void;
 }
 
@@ -50,6 +51,7 @@ export function LiveStreamStage({
   hostId,
   streamState,
   reactions,
+  viewers,
   onStreamStateChanged,
 }: LiveStreamStageProps) {
   // Host stream state
@@ -76,7 +78,7 @@ export function LiveStreamStage({
   // WebRTC Peer Connections map (for Host: viewerId -> RTCPeerConnection; for Viewer: 'host' -> RTCPeerConnection)
   const peerConnectionsRef = useRef<Map<string, RTCPeerConnection>>(new Map());
   const pendingCandidatesRef = useRef<Map<string, RTCIceCandidateInit[]>>(new Map());
-  const lastSignalPollRef = useRef<number>(Date.now() - 5000);
+  const processedSignalsRef = useRef<Set<string>>(new Set());
 
   // ==========================================
   // 1. HOST: Start / Stop Screen Sharing
@@ -124,6 +126,15 @@ export function LiveStreamStage({
           streamUpdate: newStreamState,
         }),
       });
+
+      // Broadcast offers to all currently active viewers
+      if (viewers) {
+        Object.keys(viewers).forEach((vId) => {
+          if (vId !== currentUserId) {
+            sendOfferToViewer(vId, result.stream);
+          }
+        });
+      }
     } catch (err) {
       console.error('Failed to start screen share:', err);
     }
@@ -223,10 +234,11 @@ export function LiveStreamStage({
   };
 
   // Send SDP Offer to a viewer (Host side)
-  const sendOfferToViewer = async (viewerId: string) => {
-    if (!captureResult?.stream) return;
+  const sendOfferToViewer = async (viewerId: string, streamOverride?: MediaStream) => {
+    const activeStream = streamOverride || captureResult?.stream;
+    if (!activeStream) return;
     try {
-      const pc = getOrCreateHostPeer(viewerId, captureResult.stream);
+      const pc = getOrCreateHostPeer(viewerId, activeStream);
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
 
@@ -258,10 +270,6 @@ export function LiveStreamStage({
     pc.ontrack = (event) => {
       if (event.streams && event.streams[0]) {
         setRemoteStream(event.streams[0]);
-        if (remoteVideoRef.current) {
-          remoteVideoRef.current.srcObject = event.streams[0];
-          remoteVideoRef.current.play().catch(() => {});
-        }
         setConnectionStatus('connected');
       }
     };
@@ -358,10 +366,11 @@ export function LiveStreamStage({
     }
   };
 
-  // Viewer requests stream when entering or when host goes live
+  // Viewer requests stream when entering or when host goes live (retries every 2.5s until connected)
   useEffect(() => {
-    if (!isHost && streamState.isStreaming) {
-      setConnectionStatus('connecting');
+    if (isHost || !streamState.isStreaming || connectionStatus === 'connected') return;
+
+    const requestStream = () => {
       fetch(`/api/rooms/${roomId}/signal`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -370,9 +379,31 @@ export function LiveStreamStage({
           senderId: currentUserId,
           targetId: hostId,
         }),
-      }).catch(console.error);
+      }).catch(() => {});
+    };
+
+    requestStream();
+    const interval = setInterval(requestStream, 2500);
+    return () => clearInterval(interval);
+  }, [isHost, streamState.isStreaming, connectionStatus, hostId, roomId, currentUserId]);
+
+  // Ensure remote stream is attached to video element and starts playing immediately
+  useEffect(() => {
+    if (remoteVideoRef.current && remoteStream) {
+      remoteVideoRef.current.srcObject = remoteStream;
+      const p = remoteVideoRef.current.play();
+      if (p !== undefined) {
+        p.catch((err) => {
+          console.warn('Autoplay blocked with sound, falling back to muted play:', err);
+          if (remoteVideoRef.current) {
+            remoteVideoRef.current.muted = true;
+            setIsMuted(true);
+            remoteVideoRef.current.play().catch(console.error);
+          }
+        });
+      }
     }
-  }, [isHost, streamState.isStreaming, hostId, roomId, currentUserId]);
+  }, [remoteStream]);
 
   // ==========================================
   // 3. Signaling Polling Loop (Every 800ms)
@@ -382,16 +413,16 @@ export function LiveStreamStage({
 
     const pollSignals = async () => {
       try {
-        const since = lastSignalPollRef.current;
-        const res = await fetch(`/api/rooms/${roomId}/signal?viewerId=${currentUserId}&since=${since}`);
+        const res = await fetch(`/api/rooms/${roomId}/signal?viewerId=${currentUserId}`);
         if (!res.ok) return;
 
         const data = await res.json();
         if (!isMounted || !data.signals) return;
 
-        lastSignalPollRef.current = Date.now();
-
         for (const sig of data.signals as SignalMessage[]) {
+          if (processedSignalsRef.current.has(sig.id)) continue;
+          processedSignalsRef.current.add(sig.id);
+
           if (sig.type === 'request-stream' && isHost) {
             // Viewer asked for host stream
             sendOfferToViewer(sig.senderId);
@@ -660,6 +691,31 @@ export function LiveStreamStage({
             playsInline
             className="w-full h-full object-contain"
           />
+
+          {/* If video stream is connecting / buffering */}
+          {!remoteStream && (
+            <div className="absolute inset-0 flex flex-col items-center justify-center bg-cinema-950/95 z-10 space-y-3 animate-fade-in">
+              <div className="w-10 h-10 border-3 border-brand-500 border-t-transparent rounded-full animate-spin" />
+              <div className="text-center space-y-1">
+                <p className="text-sm font-bold text-white">Connecting to {streamState.hostName || 'Host'}&apos;s Live Screen</p>
+                <p className="text-xs text-slate-400 font-mono">Negotiating peer-to-peer WebRTC connection...</p>
+              </div>
+            </div>
+          )}
+
+          {/* Autoplay Audio Unmute Prompt */}
+          {isMuted && remoteStream && (
+            <button
+              onClick={() => {
+                setIsMuted(false);
+                if (remoteVideoRef.current) remoteVideoRef.current.muted = false;
+              }}
+              className="absolute top-16 left-1/2 -translate-x-1/2 z-30 px-4 py-2 rounded-full bg-brand-600/95 hover:bg-brand-500 text-white text-xs font-bold shadow-2xl backdrop-blur-md flex items-center gap-2 animate-bounce cursor-pointer border border-brand-400/40"
+            >
+              <VolumeX className="w-4 h-4 text-white" />
+              <span>Click to Unmute Live Audio</span>
+            </button>
+          )}
 
           {/* Top Live Bar */}
           <div className="absolute top-4 left-4 right-4 flex items-center justify-between z-20 pointer-events-none">

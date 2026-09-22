@@ -24,23 +24,23 @@ export default function CinemaRoomPage() {
   const [userColor, setUserColor] = useState<string>(AVATAR_COLORS[0]);
   const [isLoading, setIsLoading] = useState(true);
 
-  // Initialize or restore user identity from localStorage
+  // Initialize or restore user identity from sessionStorage (unique per browser tab)
   useEffect(() => {
-    let savedId = localStorage.getItem('cw_user_id');
-    let savedName = localStorage.getItem('cw_user_name');
-    let savedColor = localStorage.getItem('cw_user_color');
+    let savedId = sessionStorage.getItem('cw_user_id');
+    let savedName = sessionStorage.getItem('cw_user_name');
+    let savedColor = sessionStorage.getItem('cw_user_color');
 
     if (!savedId) {
-      savedId = `viewer-${Math.random().toString(36).substring(2, 8)}`;
-      localStorage.setItem('cw_user_id', savedId);
+      savedId = `viewer-${Math.random().toString(36).substring(2, 7)}-${Date.now().toString(36).slice(-4)}`;
+      sessionStorage.setItem('cw_user_id', savedId);
     }
     if (!savedName) {
       savedName = `Viewer ${Math.floor(Math.random() * 900 + 100)}`;
-      localStorage.setItem('cw_user_name', savedName);
+      sessionStorage.setItem('cw_user_name', savedName);
     }
     if (!savedColor) {
       savedColor = AVATAR_COLORS[Math.floor(Math.random() * AVATAR_COLORS.length)];
-      localStorage.setItem('cw_user_color', savedColor);
+      sessionStorage.setItem('cw_user_color', savedColor);
     }
 
     setUserId(savedId);
@@ -252,7 +252,7 @@ export default function CinemaRoomPage() {
 
   const handleUpdateUserName = (newName: string) => {
     setUserName(newName);
-    localStorage.setItem('cw_user_name', newName);
+    sessionStorage.setItem('cw_user_name', newName);
   };
 
   if (isLoading || !room) {
@@ -332,6 +332,7 @@ export default function CinemaRoomPage() {
               hostId={room.hostId}
               streamState={room.streamState}
               reactions={room.reactions}
+              viewers={room.viewers}
               onStreamStateChanged={handleStreamStateChanged}
             />
           ) : (
