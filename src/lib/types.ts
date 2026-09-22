@@ -55,6 +55,7 @@ export interface StreamState {
   resolution: '1080p' | '720p' | '4k';
   startedAt?: number;
   hostName: string;
+  hostPeerId?: string;
 }
 
 export interface SignalMessage {

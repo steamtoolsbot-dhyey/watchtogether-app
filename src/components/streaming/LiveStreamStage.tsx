@@ -24,6 +24,7 @@ import {
 import { StreamState, EmojiReaction, SignalMessage } from '@/lib/types';
 import {
   RTC_CONFIG,
+  createDummyMediaStream,
   startScreenCapture,
   stopMediaStream,
   createAudioLevelMeter,
@@ -42,6 +43,12 @@ interface LiveStreamStageProps {
   reactions: EmojiReaction[];
   viewers?: Record<string, any>;
   onStreamStateChanged: (update: Partial<StreamState>) => void;
+}
+
+// Safely get PeerJS class on client side
+async function getPeerClass() {
+  const mod = await import('peerjs');
+  return (mod as any).Peer || (mod as any).default?.Peer || (mod as any).default;
 }
 
 export function LiveStreamStage({
@@ -69,7 +76,7 @@ export function LiveStreamStage({
   const [volume, setVolume] = useState(1);
   const [isMuted, setIsMuted] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
-  const [latencyMs, setLatencyMs] = useState(68);
+  const [latencyMs, setLatencyMs] = useState(65);
   const [connectionStatus, setConnectionStatus] = useState<'disconnected' | 'connecting' | 'connected'>('disconnected');
   const [isCheckingHost, setIsCheckingHost] = useState(false);
 
@@ -78,243 +85,88 @@ export function LiveStreamStage({
   const localVideoRef = useRef<HTMLVideoElement>(null);
   const remoteVideoRef = useRef<HTMLVideoElement>(null);
 
-  // Communication & Native WebRTC Mesh Refs
+  // Peer & Channel Refs
   const bcRef = useRef<BroadcastChannel | null>(null);
-  const eventSourceRef = useRef<EventSource | null>(null);
-  const localHostPcsRef = useRef<Map<string, RTCPeerConnection>>(new Map());
-  const localViewerPcRef = useRef<RTCPeerConnection | null>(null);
-  const localPendingIceRef = useRef<RTCIceCandidateInit[]>([]);
-  const processedSignalsRef = useRef<Set<string>>(new Set());
+  const hostPeerRef = useRef<any>(null);
+  const viewerPeerRef = useRef<any>(null);
+  const currentCallRef = useRef<any>(null);
+  const activeCallsRef = useRef<Map<string, any>>(new Map());
+  const viewerPeerIdRef = useRef<string | null>(null);
+  const captureResultRef = useRef<CaptureResult | null>(null);
+  captureResultRef.current = captureResult;
 
   const isBroadcasting = !!captureResult;
 
-  // Real-time pubsub signal dispatcher (Dual channel: BroadcastChannel + Global SSE PubSub)
-  const sendSignal = useCallback((msg: any) => {
-    const enriched = {
-      ...msg,
-      id: msg.id || `sig-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-      senderId: currentUserId,
-      senderName: currentUserName,
-      timestamp: Date.now(),
-    };
+  // Broadcaster calls a specific viewer with the screen stream
+  const callViewer = useCallback((viewerPeerId: string) => {
+    if (!hostPeerRef.current || !captureResultRef.current?.stream || !viewerPeerId) return;
+    if (activeCallsRef.current.has(viewerPeerId)) return;
 
-    // 1. BroadcastChannel (0ms local tabs)
-    bcRef.current?.postMessage(enriched);
-
-    // 2. Global Real-time PubSub (Free, unlimited cross-network signaling)
-    fetch(`https://ntfy.sh/charon-sig-${roomId}`, {
-      method: 'POST',
-      body: JSON.stringify(enriched),
-      headers: { 'Content-Type': 'text/plain' },
-    }).catch(() => {});
-
-    // 3. Serverless fallback
-    fetch(`/api/rooms/${roomId}/signal`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(enriched),
-    }).catch(() => {});
-  }, [roomId, currentUserId, currentUserName]);
-
-  // Unified stream receiver handler
-  const handleRemoteStream = useCallback((stream: MediaStream) => {
-    console.log('[LiveStream] Connected! Remote media stream tracks:', stream.getTracks().map(t => `${t.kind}:${t.enabled}`));
-    setRemoteStream(stream);
-    setConnectionStatus('connected');
-    onStreamStateChanged({ isStreaming: true });
-
-    if (remoteVideoRef.current) {
-      remoteVideoRef.current.srcObject = stream;
-      remoteVideoRef.current.play().catch(() => {
-        if (remoteVideoRef.current) {
-          remoteVideoRef.current.muted = true;
-          setIsMuted(true);
-          remoteVideoRef.current.play().catch(console.error);
-        }
-      });
-    }
-  }, [onStreamStateChanged]);
-
-  // Host creates WebRTC peer connection for a specific viewer
-  const sendOfferToViewer = useCallback(async (viewerId: string, streamOverride?: MediaStream) => {
-    const activeStream = streamOverride || captureResult?.stream;
-    if (!activeStream) return;
-
-    let pc = localHostPcsRef.current.get(viewerId);
-    if (pc && pc.signalingState !== 'closed') {
-      try { pc.close(); } catch {}
-    }
-
-    pc = new RTCPeerConnection(RTC_CONFIG);
-    localHostPcsRef.current.set(viewerId, pc);
-
-    activeStream.getTracks().forEach((track) => {
-      pc!.addTrack(track, activeStream);
-    });
-
-    pc.onicecandidate = (event) => {
-      if (event.candidate) {
-        sendSignal({
-          type: 'candidate',
-          targetId: viewerId,
-          candidate: event.candidate.toJSON ? event.candidate.toJSON() : event.candidate,
+    console.log('[Broadcaster] Calling viewer peer:', viewerPeerId);
+    try {
+      const call = hostPeerRef.current.call(viewerPeerId, captureResultRef.current.stream);
+      if (call) {
+        activeCallsRef.current.set(viewerPeerId, call);
+        call.on('close', () => activeCallsRef.current.delete(viewerPeerId));
+        call.on('error', (err: any) => {
+          console.warn('[Broadcaster] Call error for viewer', viewerPeerId, err);
+          activeCallsRef.current.delete(viewerPeerId);
         });
       }
-    };
-
-    try {
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-
-      sendSignal({
-        type: 'offer',
-        targetId: viewerId,
-        offer,
-      });
     } catch (err) {
-      console.error('[Host] createOffer error:', err);
-    }
-  }, [captureResult, sendSignal]);
-
-  // Viewer handles incoming WebRTC offer from host
-  const handleIncomingOffer = useCallback(async (offer: RTCSessionDescriptionInit, hostSenderId: string) => {
-    if (isBroadcasting) return;
-
-    setConnectionStatus('connecting');
-
-    if (localViewerPcRef.current && localViewerPcRef.current.signalingState !== 'closed') {
-      try { localViewerPcRef.current.close(); } catch {}
-    }
-
-    const pc = new RTCPeerConnection(RTC_CONFIG);
-    localViewerPcRef.current = pc;
-
-    pc.ontrack = (event) => {
-      if (event.streams && event.streams[0]) {
-        handleRemoteStream(event.streams[0]);
-      }
-    };
-
-    pc.onicecandidate = (event) => {
-      if (event.candidate) {
-        sendSignal({
-          type: 'candidate',
-          targetId: hostSenderId,
-          candidate: event.candidate.toJSON ? event.candidate.toJSON() : event.candidate,
-        });
-      }
-    };
-
-    try {
-      await pc.setRemoteDescription(new RTCSessionDescription(offer));
-
-      for (const cand of localPendingIceRef.current) {
-        await pc.addIceCandidate(new RTCIceCandidate(cand)).catch(() => {});
-      }
-      localPendingIceRef.current = [];
-
-      const answer = await pc.createAnswer();
-      await pc.setLocalDescription(answer);
-
-      sendSignal({
-        type: 'answer',
-        targetId: hostSenderId,
-        answer,
-      });
-    } catch (err) {
-      console.error('[Viewer] handleIncomingOffer error:', err);
-    }
-  }, [isBroadcasting, sendSignal, handleRemoteStream]);
-
-  // Host handles incoming WebRTC answer from viewer
-  const handleIncomingAnswer = useCallback(async (answer: RTCSessionDescriptionInit, viewerSenderId: string) => {
-    const pc = localHostPcsRef.current.get(viewerSenderId);
-    if (pc && pc.signalingState === 'have-local-offer') {
-      try {
-        await pc.setRemoteDescription(new RTCSessionDescription(answer));
-      } catch (err) {
-        console.error('[Host] handleIncomingAnswer error:', err);
-      }
+      console.warn('[Broadcaster] Error calling viewer:', err);
     }
   }, []);
 
-  // Handle incoming ICE candidate
-  const handleIncomingCandidate = useCallback(async (candidate: RTCIceCandidateInit, targetId: string, senderId: string) => {
-    if (targetId && targetId !== currentUserId) return;
+  // Viewer calls host using hostPeerId (dual-direction fallback)
+  const callHost = useCallback((targetHostPeerId: string) => {
+    if (isBroadcasting || remoteStream) return;
+    const peer = viewerPeerRef.current;
+    if (!peer || !peer.open) return;
 
-    if (isBroadcasting) {
-      const pc = localHostPcsRef.current.get(senderId);
-      if (pc && pc.remoteDescription && pc.remoteDescription.type) {
-        await pc.addIceCandidate(new RTCIceCandidate(candidate)).catch(() => {});
+    console.log('[Viewer] Calling host peer with dummy stream:', targetHostPeerId);
+    setConnectionStatus('connecting');
+
+    try {
+      if (currentCallRef.current) {
+        try { currentCallRef.current.close(); } catch {}
       }
-    } else {
-      const pc = localViewerPcRef.current;
-      if (pc && pc.remoteDescription && pc.remoteDescription.type) {
-        await pc.addIceCandidate(new RTCIceCandidate(candidate)).catch(() => {});
-      } else {
-        localPendingIceRef.current.push(candidate);
-      }
+
+      const dummyStream = createDummyMediaStream();
+      const call = peer.call(targetHostPeerId, dummyStream);
+      if (!call) return;
+      currentCallRef.current = call;
+
+      call.on('stream', (stream: MediaStream) => {
+        console.log('[Viewer] Successfully received remote stream tracks:', stream.getTracks().map(t => t.kind));
+        setRemoteStream(stream);
+        setConnectionStatus('connected');
+        onStreamStateChanged({ isStreaming: true });
+
+        if (remoteVideoRef.current) {
+          remoteVideoRef.current.srcObject = stream;
+          remoteVideoRef.current.play().catch(() => {
+            if (remoteVideoRef.current) {
+              remoteVideoRef.current.muted = true;
+              setIsMuted(true);
+              remoteVideoRef.current.play().catch(console.error);
+            }
+          });
+        }
+      });
+
+      call.on('close', () => {
+        setRemoteStream(null);
+        setConnectionStatus('disconnected');
+      });
+
+      call.on('error', (err: any) => {
+        console.warn('[Viewer] Outgoing call error:', err);
+      });
+    } catch (err) {
+      console.warn('[Viewer] Outgoing call exception:', err);
     }
-  }, [currentUserId, isBroadcasting]);
-
-  // Core signal processor
-  const processSignalMessage = useCallback((msg: any) => {
-    if (!msg || msg.senderId === currentUserId) return;
-    if (processedSignalsRef.current.has(msg.id)) return;
-    processedSignalsRef.current.add(msg.id);
-
-    // Filter target
-    if (msg.targetId && msg.targetId !== currentUserId) return;
-
-    switch (msg.type) {
-      case 'stream-started':
-        if (!isBroadcasting) {
-          onStreamStateChanged(msg.streamState);
-          // Viewer immediately requests stream offer from host
-          sendSignal({ type: 'request-stream', targetId: msg.senderId });
-        }
-        break;
-
-      case 'stream-stopped':
-        if (!isBroadcasting) {
-          onStreamStateChanged({ isStreaming: false });
-          setRemoteStream(null);
-          setConnectionStatus('disconnected');
-          if (localViewerPcRef.current) {
-            try { localViewerPcRef.current.close(); } catch {}
-            localViewerPcRef.current = null;
-          }
-        }
-        break;
-
-      case 'request-stream':
-        if (isBroadcasting && captureResult?.stream) {
-          sendOfferToViewer(msg.senderId, captureResult.stream);
-        }
-        break;
-
-      case 'offer':
-        if (!isBroadcasting && msg.offer) {
-          handleIncomingOffer(msg.offer, msg.senderId);
-        }
-        break;
-
-      case 'answer':
-        if (isBroadcasting && msg.answer) {
-          handleIncomingAnswer(msg.answer, msg.senderId);
-        }
-        break;
-
-      case 'candidate':
-        if (msg.candidate) {
-          handleIncomingCandidate(msg.candidate, msg.targetId, msg.senderId);
-        }
-        break;
-
-      default:
-        break;
-    }
-  }, [currentUserId, isBroadcasting, captureResult, onStreamStateChanged, sendSignal, sendOfferToViewer, handleIncomingOffer, handleIncomingAnswer, handleIncomingCandidate]);
+  }, [isBroadcasting, remoteStream, onStreamStateChanged]);
 
   // ============================================================
   // 1. BROADCASTER: Start / Stop Live Screen Sharing
@@ -328,6 +180,7 @@ export function LiveStreamStage({
       });
 
       setCaptureResult(result);
+      captureResultRef.current = result;
 
       if (localVideoRef.current) {
         localVideoRef.current.srcObject = result.stream;
@@ -338,32 +191,71 @@ export function LiveStreamStage({
         handleStopShare();
       };
 
-      const newStreamState: Partial<StreamState> = {
-        isStreaming: true,
-        streamTitle: `${currentUserName}'s Live Screen`,
-        hasAudio: includeAudio,
-        hasMic: includeMic,
-        resolution,
-        startedAt: Date.now(),
-        hostName: currentUserName,
-      };
+      // Initialize Broadcaster PeerJS with random unique ID
+      const PeerClass = await getPeerClass();
+      if (hostPeerRef.current) {
+        try { hostPeerRef.current.destroy(); } catch {}
+      }
 
-      onStreamStateChanged(newStreamState);
+      const hostPeer = new PeerClass({
+        config: RTC_CONFIG,
+        debug: 1,
+      });
+      hostPeerRef.current = hostPeer;
 
-      // Broadcast stream-started signal across all channels
-      sendSignal({
-        type: 'stream-started',
-        streamState: newStreamState,
+      hostPeer.on('open', (uniqueId: string) => {
+        console.log('[LiveStream Broadcaster] Online with Peer ID:', uniqueId);
+
+        const newStreamState: Partial<StreamState> = {
+          isStreaming: true,
+          streamTitle: `${currentUserName}'s Live Screen`,
+          hasAudio: includeAudio,
+          hasMic: includeMic,
+          resolution,
+          startedAt: Date.now(),
+          hostName: currentUserName,
+          hostPeerId: uniqueId,
+        };
+
+        onStreamStateChanged(newStreamState);
+
+        // Instant local tab notification
+        bcRef.current?.postMessage({
+          type: 'stream-started',
+          streamState: newStreamState,
+        });
+
+        // Broadcast to serverless API for remote viewers
+        fetch(`/api/rooms/${roomId}/signal`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            type: 'offer',
+            senderId: currentUserId,
+            senderName: currentUserName,
+            streamUpdate: newStreamState,
+          }),
+        }).catch(console.error);
+
+        // Call any existing viewers who already announced
+        if (viewers) {
+          Object.values(viewers).forEach((v: any) => {
+            if (v.peerId && v.id !== currentUserId) {
+              callViewer(v.peerId);
+            }
+          });
+        }
       });
 
-      // If active viewers are present, send offers immediately
-      if (viewers) {
-        Object.keys(viewers).forEach((vId) => {
-          if (vId !== currentUserId) {
-            sendOfferToViewer(vId, result.stream);
-          }
-        });
-      }
+      // Broadcaster answers incoming calls with screen MediaStream
+      hostPeer.on('call', (incomingCall: any) => {
+        console.log('[Broadcaster] Viewer calling, answering with screen stream:', incomingCall.peer);
+        incomingCall.answer(result.stream);
+      });
+
+      hostPeer.on('error', (err: any) => {
+        console.warn('[Broadcaster] Peer warning:', err);
+      });
 
     } catch (err) {
       console.error('Failed to start screen share:', err);
@@ -375,26 +267,44 @@ export function LiveStreamStage({
       stopMediaStream(captureResult);
       setCaptureResult(null);
     }
+    captureResultRef.current = null;
 
     if (localVideoRef.current) {
       localVideoRef.current.srcObject = null;
     }
 
-    localHostPcsRef.current.forEach((pc) => {
-      try { pc.close(); } catch {}
+    activeCallsRef.current.forEach((call) => {
+      try { call.close(); } catch {}
     });
-    localHostPcsRef.current.clear();
+    activeCallsRef.current.clear();
+
+    if (hostPeerRef.current) {
+      try { hostPeerRef.current.destroy(); } catch {}
+      hostPeerRef.current = null;
+    }
 
     const stoppedState: Partial<StreamState> = {
       isStreaming: false,
       startedAt: undefined,
+      hostPeerId: undefined,
     };
 
     onStreamStateChanged(stoppedState);
 
-    sendSignal({
+    bcRef.current?.postMessage({
       type: 'stream-stopped',
     });
+
+    fetch(`/api/rooms/${roomId}/signal`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        type: 'stop',
+        senderId: currentUserId,
+        senderName: currentUserName,
+        streamUpdate: stoppedState,
+      }),
+    }).catch(console.error);
   };
 
   // Toggle microphone
@@ -420,34 +330,168 @@ export function LiveStreamStage({
   }, [captureResult]);
 
   // ============================================================
-  // 2. Real-time PubSub Listener (Global Free SSE Channel)
+  // 2. VIEWER: Connect & Receive Host Stream
   // ============================================================
   useEffect(() => {
-    if (typeof window === 'undefined') return;
+    if (isBroadcasting) return;
 
-    let es: EventSource | null = null;
-    try {
-      es = new EventSource(`https://ntfy.sh/charon-sig-${roomId}/sse`);
-      eventSourceRef.current = es;
+    let peer: any = null;
+    let isMounted = true;
 
-      es.onmessage = (event) => {
-        try {
-          const raw = JSON.parse(event.data);
-          if (raw.event === 'message' && raw.message) {
-            const parsed = JSON.parse(raw.message);
-            processSignalMessage(parsed);
+    const initViewer = async () => {
+      try {
+        const PeerClass = await getPeerClass();
+        if (!isMounted) return;
+
+        peer = new PeerClass({
+          config: RTC_CONFIG,
+          debug: 1,
+        });
+        viewerPeerRef.current = peer;
+
+        peer.on('open', (id: string) => {
+          console.log('[Viewer PeerJS] Ready with ID:', id);
+          viewerPeerIdRef.current = id;
+
+          // 1. Announce locally via BroadcastChannel
+          bcRef.current?.postMessage({
+            type: 'viewer-ready',
+            viewerPeerId: id,
+            senderId: currentUserId,
+          });
+
+          // 2. Announce remotely via API signal
+          fetch(`/api/rooms/${roomId}/signal`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              type: 'viewer-ready',
+              viewerPeerId: id,
+              senderId: currentUserId,
+            }),
+          }).catch(() => {});
+
+          // 3. If streamState already has hostPeerId, call host
+          if (streamState.isStreaming && streamState.hostPeerId) {
+            callHost(streamState.hostPeerId);
           }
-        } catch {}
-      };
-    } catch (e) {
-      console.warn('SSE connection error:', e);
-    }
+        });
+
+        // Viewer answers incoming call from Broadcaster (direct 1-to-many mesh)
+        peer.on('call', (incomingCall: any) => {
+          console.log('[Viewer] Incoming call from broadcaster:', incomingCall.peer);
+          incomingCall.answer(); // NO stream needed to answer!
+          currentCallRef.current = incomingCall;
+
+          incomingCall.on('stream', (stream: MediaStream) => {
+            console.log('[Viewer] Remote screen stream received via incoming call:', stream.id);
+            setRemoteStream(stream);
+            setConnectionStatus('connected');
+            onStreamStateChanged({ isStreaming: true });
+
+            if (remoteVideoRef.current) {
+              remoteVideoRef.current.srcObject = stream;
+              remoteVideoRef.current.play().catch(() => {
+                if (remoteVideoRef.current) {
+                  remoteVideoRef.current.muted = true;
+                  setIsMuted(true);
+                  remoteVideoRef.current.play().catch(console.error);
+                }
+              });
+            }
+          });
+
+          incomingCall.on('close', () => {
+            console.log('[Viewer] Call closed by host');
+            setRemoteStream(null);
+            setConnectionStatus('disconnected');
+          });
+
+          incomingCall.on('error', (err: any) => {
+            console.warn('[Viewer] Incoming call error:', err);
+          });
+        });
+
+        peer.on('error', (err: any) => {
+          console.warn('[Viewer PeerJS] Warning:', err);
+        });
+      } catch (err) {
+        console.error('Failed to init viewer peer:', err);
+      }
+    };
+
+    initViewer();
 
     return () => {
-      es?.close();
-      eventSourceRef.current = null;
+      isMounted = false;
+      viewerPeerIdRef.current = null;
+      if (currentCallRef.current) {
+        try { currentCallRef.current.close(); } catch {}
+      }
+      if (peer) {
+        try { peer.destroy(); } catch {}
+      }
+      viewerPeerRef.current = null;
     };
-  }, [roomId, processSignalMessage]);
+  }, [isBroadcasting, roomId, currentUserId, streamState.isStreaming, streamState.hostPeerId, callHost]);
+
+  // Auto-connect when stream is active with hostPeerId
+  useEffect(() => {
+    if (isBroadcasting || remoteStream) return;
+
+    if (streamState.isStreaming && streamState.hostPeerId) {
+      callHost(streamState.hostPeerId);
+    }
+  }, [isBroadcasting, remoteStream, streamState.isStreaming, streamState.hostPeerId, callHost]);
+
+  // Periodic retry & announce if stream is active but not connected yet
+  useEffect(() => {
+    if (isBroadcasting || remoteStream || !streamState.isStreaming) return;
+
+    const interval = setInterval(() => {
+      if (viewerPeerIdRef.current) {
+        bcRef.current?.postMessage({
+          type: 'viewer-ready',
+          viewerPeerId: viewerPeerIdRef.current,
+          senderId: currentUserId,
+        });
+
+        fetch(`/api/rooms/${roomId}/signal`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            type: 'viewer-ready',
+            viewerPeerId: viewerPeerIdRef.current,
+            senderId: currentUserId,
+          }),
+        }).catch(() => {});
+      }
+
+      if (streamState.hostPeerId) {
+        callHost(streamState.hostPeerId);
+      }
+    }, 2000);
+
+    return () => clearInterval(interval);
+  }, [isBroadcasting, remoteStream, streamState.isStreaming, streamState.hostPeerId, currentUserId, roomId, callHost]);
+
+  // Ensure remote stream is playing
+  useEffect(() => {
+    if (remoteVideoRef.current && remoteStream) {
+      remoteVideoRef.current.srcObject = remoteStream;
+      const p = remoteVideoRef.current.play();
+      if (p !== undefined) {
+        p.catch((err) => {
+          console.warn('Autoplay blocked with sound, falling back to muted play:', err);
+          if (remoteVideoRef.current) {
+            remoteVideoRef.current.muted = true;
+            setIsMuted(true);
+            remoteVideoRef.current.play().catch(console.error);
+          }
+        });
+      }
+    }
+  }, [remoteStream]);
 
   // ============================================================
   // 3. Multi-Tab Local Sync via BroadcastChannel (0ms latency)
@@ -460,23 +504,60 @@ export function LiveStreamStage({
 
     bc.onmessage = (event) => {
       const msg = event.data;
-      if (msg) {
-        processSignalMessage(msg);
+      if (!msg) return;
+
+      if (msg.type === 'stream-started' && !isBroadcasting) {
+        onStreamStateChanged(msg.streamState);
+        if (msg.streamState?.hostPeerId) {
+          callHost(msg.streamState.hostPeerId);
+        }
+        if (viewerPeerIdRef.current) {
+          bc.postMessage({
+            type: 'viewer-ready',
+            viewerPeerId: viewerPeerIdRef.current,
+            senderId: currentUserId,
+          });
+        }
+      } else if (msg.type === 'stream-stopped' && !isBroadcasting) {
+        onStreamStateChanged({ isStreaming: false });
+        setRemoteStream(null);
+        setConnectionStatus('disconnected');
+      } else if (msg.type === 'viewer-ready' && isBroadcasting && msg.viewerPeerId) {
+        console.log('[Broadcaster] Detected viewer ready via BroadcastChannel:', msg.viewerPeerId);
+        callViewer(msg.viewerPeerId);
+      } else if (msg.type === 'query-stream' && isBroadcasting && captureResultRef.current?.stream && hostPeerRef.current?.id) {
+        bc.postMessage({
+          type: 'stream-started',
+          streamState: {
+            isStreaming: true,
+            streamTitle: `${currentUserName}'s Live Screen`,
+            hasAudio: includeAudio,
+            hasMic: includeMic,
+            resolution,
+            startedAt: Date.now(),
+            hostName: currentUserName,
+            hostPeerId: hostPeerRef.current.id,
+          },
+        });
       }
     };
 
     if (!isBroadcasting) {
-      sendSignal({ type: 'request-stream' });
+      bc.postMessage({
+        type: 'query-stream',
+        senderId: currentUserId,
+        viewerPeerId: viewerPeerIdRef.current,
+      });
     }
 
     return () => {
       bc.close();
       bcRef.current = null;
     };
-  }, [roomId, isBroadcasting, processSignalMessage, sendSignal]);
+  }, [roomId, isBroadcasting, currentUserId, currentUserName, includeAudio, includeMic, resolution, onStreamStateChanged, callHost, callViewer]);
 
   // ============================================================
-  // 4. Serverless API Polling Fallback (Every 1200ms)
+  // 4. Serverless API Polling (Every 1000ms)
   // ============================================================
   useEffect(() => {
     let isMounted = true;
@@ -489,40 +570,55 @@ export function LiveStreamStage({
         const data = await res.json();
         if (!isMounted) return;
 
-        if (data.streamState && (!streamState || data.streamState.isStreaming !== streamState.isStreaming)) {
-          onStreamStateChanged(data.streamState);
+        // If broadcaster: process signals from viewers
+        if (isBroadcasting && data.signals) {
+          for (const sig of data.signals) {
+            const vPeerId = sig.data?.viewerPeerId || sig.viewerPeerId;
+            if (sig.type === 'viewer-ready' && vPeerId) {
+              console.log('[Broadcaster] Detected viewer ready via API signal:', vPeerId);
+              callViewer(vPeerId);
+            }
+          }
         }
 
-        if (data.signals) {
-          for (const sig of data.signals as SignalMessage[]) {
-            processSignalMessage(sig);
+        // If viewer: update stream state & call host if needed
+        if (data.streamState && (!streamState || data.streamState.isStreaming !== streamState.isStreaming || data.streamState.hostPeerId !== streamState.hostPeerId)) {
+          onStreamStateChanged(data.streamState);
+          if (data.streamState.isStreaming && data.streamState.hostPeerId && !isBroadcasting && !remoteStream) {
+            callHost(data.streamState.hostPeerId);
           }
         }
       } catch {}
     };
 
-    const interval = setInterval(pollSignals, 1200);
+    const interval = setInterval(pollSignals, 1000);
     return () => {
       isMounted = false;
       clearInterval(interval);
     };
-  }, [roomId, currentUserId, streamState, onStreamStateChanged, processSignalMessage]);
+  }, [roomId, currentUserId, streamState, isBroadcasting, remoteStream, onStreamStateChanged, callHost, callViewer]);
 
-  // Periodic keep-alive for viewer until stream is established
-  useEffect(() => {
-    if (isBroadcasting || remoteStream || !streamState.isStreaming) return;
-
-    const interval = setInterval(() => {
-      sendSignal({ type: 'request-stream' });
-    }, 2500);
-
-    return () => clearInterval(interval);
-  }, [isBroadcasting, remoteStream, streamState.isStreaming, sendSignal]);
-
-  // Manual Check Host / Reconnect button
+  // Manual Reconnect button
   const handleManualCheckHost = async () => {
     setIsCheckingHost(true);
-    sendSignal({ type: 'request-stream' });
+
+    if (viewerPeerIdRef.current) {
+      bcRef.current?.postMessage({
+        type: 'viewer-ready',
+        viewerPeerId: viewerPeerIdRef.current,
+        senderId: currentUserId,
+      });
+
+      fetch(`/api/rooms/${roomId}/signal`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          type: 'viewer-ready',
+          viewerPeerId: viewerPeerIdRef.current,
+          senderId: currentUserId,
+        }),
+      }).catch(() => {});
+    }
 
     try {
       const res = await fetch(`/api/rooms/${roomId}/signal?viewerId=${currentUserId}`);
@@ -530,6 +626,9 @@ export function LiveStreamStage({
         const data = await res.json();
         if (data.streamState) {
           onStreamStateChanged(data.streamState);
+          if (data.streamState.hostPeerId) {
+            callHost(data.streamState.hostPeerId);
+          }
         }
       }
     } catch {}
@@ -545,14 +644,14 @@ export function LiveStreamStage({
     return () => clearInterval(timer);
   }, []);
 
-  // Sync volume with remote video element
+  // Sync volume
   useEffect(() => {
     if (remoteVideoRef.current) {
       remoteVideoRef.current.volume = isMuted ? 0 : volume;
     }
   }, [volume, isMuted]);
 
-  // Fullscreen toggle
+  // Fullscreen
   const toggleFullscreen = () => {
     if (!stageContainerRef.current) return;
     if (!document.fullscreenElement) {
@@ -564,7 +663,7 @@ export function LiveStreamStage({
     }
   };
 
-  // Picture in picture
+  // PiP
   const togglePictureInPicture = async () => {
     const video = isBroadcasting ? localVideoRef.current : remoteVideoRef.current;
     if (!video) return;
@@ -698,13 +797,13 @@ export function LiveStreamStage({
             className="w-full h-full object-contain"
           />
 
-          {/* If video stream is negotiating / connecting */}
+          {/* If video stream is connecting / buffering */}
           {!remoteStream && (
             <div className="absolute inset-0 flex flex-col items-center justify-center bg-cinema-950/95 z-10 space-y-3 animate-fade-in p-6">
               <div className="w-10 h-10 border-3 border-brand-500 border-t-transparent rounded-full animate-spin" />
               <div className="text-center space-y-1">
                 <p className="text-sm font-bold text-white">Connecting to {streamState.hostName || 'Host'}&apos;s Live Screen</p>
-                <p className="text-xs text-slate-400 font-mono">Negotiating peer-to-peer WebRTC connection...</p>
+                <p className="text-xs text-slate-400 font-mono">P2P Mesh with Automatic Free TURN Fallback...</p>
               </div>
               <button
                 onClick={handleManualCheckHost}
@@ -909,7 +1008,7 @@ export function LiveStreamStage({
 
           <div className="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full text-[11px] font-mono bg-cinema-850/80 border border-slate-800 text-slate-400">
             <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse" />
-            <span>Room #{roomId} Standby Mode • Native WebRTC Mesh Active</span>
+            <span>Room #{roomId} Standby Mode • P2P Mesh with Free TURN</span>
           </div>
         </div>
       )}

@@ -67,7 +67,7 @@ export async function POST(req: NextRequest, { params }: { params: { roomId: str
       type,
       senderId,
       targetId,
-      data,
+      data: data || (body.viewerPeerId ? { viewerPeerId: body.viewerPeerId } : undefined),
     });
 
     return NextResponse.json({

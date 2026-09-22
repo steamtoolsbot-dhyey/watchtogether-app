@@ -16,10 +16,31 @@ export const RTC_CONFIG: RTCConfiguration = {
     { urls: 'stun:stun3.l.google.com:19302' },
     { urls: 'stun:stun4.l.google.com:19302' },
     { urls: 'stun:stun.cloudflare.com:3478' },
-    { urls: 'stun:openrelay.metered.ca:80' },
   ],
   iceCandidatePoolSize: 10,
 };
+
+/**
+ * Creates a silent, ultra-lightweight dummy MediaStream with 1x1 black canvas
+ * so that a viewer can originate a WebRTC PeerJS call without needing camera/mic permissions.
+ */
+export function createDummyMediaStream(): MediaStream {
+  if (typeof document === 'undefined') {
+    return new MediaStream();
+  }
+  const canvas = document.createElement('canvas');
+  canvas.width = 2;
+  canvas.height = 2;
+  const ctx = canvas.getContext('2d');
+  if (ctx) {
+    ctx.fillStyle = '#000000';
+    ctx.fillRect(0, 0, 2, 2);
+  }
+  if ((canvas as any).captureStream) {
+    return (canvas as any).captureStream(1);
+  }
+  return new MediaStream();
+}
 
 export interface ScreenCaptureOptions {
   resolution?: '1080p' | '720p' | '4k';
